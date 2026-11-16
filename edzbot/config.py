@@ -65,6 +65,7 @@ class Config:
     volume_quiet: int
     poll_seconds: int
     send_delay: float
+    source_scan_enabled: bool
     log_level: str
 
     @classmethod
@@ -127,6 +128,7 @@ class Config:
             poll_seconds=int(os.getenv('POLL_SECONDS', '30')),
             send_delay=float(os.getenv('SEND_DELAY_SECONDS', '3')), 
             log_level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+            source_scan_enabled=_boolean('EDZ_SOURCE_SCAN_ENABLED', False),
         )
         if (cfg.max_archive_files < 1 or cfg.max_unpack_bytes < 1 or cfg.poll_seconds < 1
                 or cfg.max_group_bytes <= 0 or cfg.plan_max_pending_artifacts < 1

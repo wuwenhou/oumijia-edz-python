@@ -370,6 +370,9 @@ class Service:
                 self.db.set('manual_inbox_highwater', str(high))
 
     async def backfill(self):
+        if not self.cfg.source_scan_enabled:
+            log.info('Live source scan disabled (EDZ_SOURCE_SCAN_ENABLED=false); no history backfill')
+            return
         if self.db.value('backfill_complete') == 'true':
             log.info('History already indexed; skipping backfill')
             return
@@ -552,6 +555,15 @@ class Service:
 
     async def publish_one(self, a):
         if self.cfg.dry_run:
+            return
+        # Compatibility guard (spec): never publish a normalized EDZ name that
+        # is already accepted/posted, regardless of SHA-256. Different names
+        # sharing a SHA remain independent artifacts.
+        from .name_guard import name_already_published
+        if name_already_published(self.db, a['file_name']):
+            self.db.update_artifact(a['sha256'], 'held',
+                error='DUPLICATE_NAME: normalized EDZ name already accepted/posted')
+            log.info('Duplicate normalized name skipped (held): %s', a['file_name'])
             return
         if a['state'] == 'review' and not self.cfg.allow_unverified:
             return
@@ -805,7 +817,7 @@ class Service:
             if self.cfg.auto_mode and time.monotonic() - last_daily_scan_check >= 60:
                 last_daily_scan_check = time.monotonic()
                 from .daily_scan import due, scan_once, retry_later
-                if due(self.db):
+                if due(self.db) and self.cfg.source_scan_enabled:
                     try:
                         result = await scan_once(self.db, self.client, self.source, self.enqueue)
                         log.info('OUMIJIA: Quét nguồn hằng ngày xong: %s', result)
