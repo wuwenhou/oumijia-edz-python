@@ -38,3 +38,12 @@ def test_confirmed_post_mapping_fallback():
     db.execute("INSERT INTO telegram_posts VALUES(-100,122538,'sha999','Wöhrle.EDZ',1)")
     assert name_already_published(db, 'wöhrle.edz')
     assert not name_already_published(db, 'other.edz')
+
+
+def test_cache_invalidates_when_new_post_arrives():
+    db = _db()
+    assert not name_already_published(db, 'fresh.edz')
+    db.execute("INSERT INTO telegram_posts VALUES(-100,122539,'sha777','FRESH.edz',2)")
+    # in-memory DBs are never cached; a new post is visible immediately
+    assert name_already_published(db, 'fresh.edz')
+

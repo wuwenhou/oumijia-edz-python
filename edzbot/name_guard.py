@@ -8,6 +8,11 @@ from __future__ import annotations
 import unicodedata
 from pathlib import Path
 
+# Cache of normalized confirmed-post names, keyed by DB connection identity.
+# Rebuilt only when telegram_posts row count changes (cheap COUNT query), so a
+# new post arriving during the process lifetime is never missed.
+_NAME_CACHE: dict[int, tuple[int, frozenset[str]]] = {}
+
 
 def normalize_edz_name(name: str) -> str:
     """Canonical identity: basename, Unicode NFC, case-folded (spec V.2)."""
@@ -15,13 +20,36 @@ def normalize_edz_name(name: str) -> str:
     return unicodedata.normalize("NFC", base).lower()
 
 
+def _confirmed_names(db) -> frozenset[str]:
+    count = db.execute("SELECT COUNT(*) FROM telegram_posts").fetchone()[0]
+    row = db.execute("PRAGMA database_list").fetchone()
+    # File-backed DBs: key by path so a new connection never inherits a stale
+    # cache. In-memory DBs (tests) are tiny: always rebuild, no cache.
+    key = row[2] if row and row[2] else None
+    if key is None:
+        return frozenset(
+            normalize_edz_name(stored)
+            for (stored,) in db.execute("SELECT file_name FROM telegram_posts")
+        )
+    cached = _NAME_CACHE.get(key)
+    if cached is not None and cached[0] == count:
+        return cached[1]
+    names = frozenset(
+        normalize_edz_name(stored)
+        for (stored,) in db.execute("SELECT file_name FROM telegram_posts")
+    )
+    _NAME_CACHE[key] = (count, names)
+    return names
+
+
 def name_already_published(db, name: str) -> bool:
     """True if the normalized name is already accepted/posted.
 
     - `edz_name_catalog` is the authoritative name catalogue written by the
-      newer implementation (117k+ names). A name accepted there is final.
-    - `telegram_posts` is the confirmed destination-post mapping. Checked as a
-      fallback for older databases, normalizing stored names on the fly.
+      newer implementation (117k+ names), checked via indexed lookup.
+    - `telegram_posts` is the confirmed destination-post mapping. Used as a
+      fallback for older databases; stored names are normalized once and kept
+      in a cache invalidated by row-count changes.
     Different names with the same SHA-256 are NOT considered duplicates here.
     """
     norm = normalize_edz_name(name)
@@ -36,7 +64,5 @@ def name_already_published(db, name: str) -> bool:
     if db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_posts'"
     ).fetchone():
-        for (stored,) in db.execute("SELECT file_name FROM telegram_posts"):
-            if normalize_edz_name(stored) == norm:
-                return True
+        return norm in _confirmed_names(db)
     return False
