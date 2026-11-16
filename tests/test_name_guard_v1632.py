@@ -40,6 +40,15 @@ def test_confirmed_post_mapping_fallback():
     assert not name_already_published(db, 'other.edz')
 
 
+def test_missing_telegram_posts_table_and_artifacts_fallback():
+    db = sqlite3.connect(':memory:')
+    db.execute("CREATE TABLE artifacts(sha256 TEXT PRIMARY KEY, file_name TEXT, state TEXT, path TEXT, size_bytes INTEGER, source_message INTEGER, origin TEXT, brand TEXT, part_number TEXT, validation TEXT, created_at REAL, updated_at REAL, normalized_name TEXT)")
+    db.execute("INSERT INTO artifacts(sha256,file_name,state,normalized_name) VALUES('s1','PythonPosted.edz','posted','pythonposted.edz')")
+    # no telegram_posts table at all -> must not raise, and artifact state wins
+    assert name_already_published(db, 'PYTHONPOSTED.edz')
+    assert not name_already_published(db, 'never-seen.edz')
+
+
 def test_cache_invalidates_when_new_post_arrives():
     db = _db()
     assert not name_already_published(db, 'fresh.edz')

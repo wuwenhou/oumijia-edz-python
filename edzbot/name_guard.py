@@ -21,6 +21,10 @@ def normalize_edz_name(name: str) -> str:
 
 
 def _confirmed_names(db) -> frozenset[str]:
+    if not db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_posts'"
+    ).fetchone():
+        return frozenset()
     count = db.execute("SELECT COUNT(*) FROM telegram_posts").fetchone()[0]
     row = db.execute("PRAGMA database_list").fetchone()
     # File-backed DBs: key by path so a new connection never inherits a stale
@@ -58,6 +62,17 @@ def name_already_published(db, name: str) -> bool:
     ).fetchone():
         if db.execute(
             "SELECT 1 FROM edz_name_catalog WHERE normalized_name=? AND state='accepted'",
+            (norm,),
+        ).fetchone():
+            return True
+    # Python-posted names live in artifacts.normalized_name (the Rust-only
+    # telegram_posts table is not updated by Python). Check it so deleting that
+    # legacy table cannot weaken duplicate protection.
+    if db.execute(
+        "SELECT 1 FROM pragma_table_info('artifacts') WHERE name='normalized_name'"
+    ).fetchone():
+        if db.execute(
+            "SELECT 1 FROM artifacts WHERE normalized_name=? AND state='posted' LIMIT 1",
             (norm,),
         ).fetchone():
             return True
