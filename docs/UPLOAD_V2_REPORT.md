@@ -286,6 +286,22 @@ Commit: `398047c` (sau `76d3b71`) · **150/150 test PASS**.
 - Xác nhận trực tiếp qua Control Bot: `/help` msg #3448, `/status` msg #3447 —
   `duplicate: 0`, xuống dòng đúng, V2 BẬT 1/1.
 
+## 5f. CONTROL BOT CLEANUP (staging only, chưa deploy)
+
+- `/help` chỉ còn **7 lệnh chính**: `/help`, `/files`, `/process`, `/cancel`,
+  `/status`, `/health`, `/errors`. Bỏ `/limit` và `/speed` khỏi help — cả hai vẫn
+  là lệnh ẩn phục vụ sự cố.
+- Gộp `/check` vào `/files`: `/files Ten-goi.7z N` kiểm tra bộ nén; `/check` giữ
+  làm alias ẩn.
+- `/errors csv`, `/errors files` hoạt động; giữ alias `/errorscsv`, `/errorsfiles`.
+- `/status`: tách rõ **lịch sử** (từ `artifacts`) và **phiên này** (stats in-memory
+  của V2); thêm dòng `Pacing: cố định từ SEND_DELAY_SECONDS/override — V2 không tự
+  đổi khoảng nghỉ; chỉ tuân thủ FloodWait`. Không tuyên bố V2 tự điều tốc.
+- **158/158 test PASS** trên clone, gồm parser, admin gate, 7 lệnh help, merge
+  files/check, alias errors, phân biệt session/history.
+- Không đụng chính sách upload, không thêm Publisher, **không deploy/restart
+  production** khi chưa có phê duyệt riêng.
+
 ## 6. Giới hạn đã biết / rủi ro phải biết
 
 1. **`artifacts.sha256 PRIMARY KEY` vẫn còn** — V2 tách danh tính tên sang bảng phụ,

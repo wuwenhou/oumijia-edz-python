@@ -35,8 +35,16 @@ REMEDIES = {
 
 
 def parse_request(text: str):
-    """Return (mode, optional identifier) for commands owned by this add-on."""
-    m = REPORT_RE.fullmatch((text or '').strip())
+    """Return (mode, optional identifier) for commands owned by this add-on.
+
+    Accepts the legacy aliases (/errorscsv, /errorsfiles) and the new spaced
+    forms (/errors csv, /errors files).
+    """
+    raw = (text or '').strip()
+    spaced = re.fullmatch(r'/errors\s+(csv|files)\s*', raw, re.I)
+    if spaced:
+        raw = '/errors' + spaced.group(1).lower()
+    m = REPORT_RE.fullmatch(raw)
     if not m:
         return None
     suffix, arg = m.group(1), (m.group(2) or '').strip()

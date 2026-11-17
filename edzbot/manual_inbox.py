@@ -177,11 +177,12 @@ def parse_command(text: str) -> tuple[str, str | None, int | None] | None:
         if match:
             return command, safe_basename(match.group(1)), int(match.group(2))
         raise ValueError('Dùng /process hoặc /process Ten-goi.7z SO_PHAN')
-    if command == 'check' and arg:
+    # /files now owns the multipart inspection; /check stays as a hidden alias.
+    if command in ('files', 'check') and arg:
         match = _MULTIPART.fullmatch(arg)
         if match:
             return command, safe_basename(match.group(1)), int(match.group(2))
-        raise ValueError('Dùng /check hoặc /check Ten-goi.7z SO_PHAN')
+        raise ValueError(f'Dùng /files Ten-goi.7z SO_PHAN (alias: /{command})')
     if command == 'limit':
         if not arg:
             return 'limit', None, None

@@ -170,13 +170,38 @@ class Service:
             'SELECT state,COUNT(*) n FROM upload_jobs GROUP BY state').fetchall()}
         fault = ('\n⚠️ Upload V2 FAULTED — publisher đã khóa, cần operator xử lý\n'
                  if self.upload_engine.faulted else '')
+        source = ('override /limit' if override_delay(self.db) is not None
+                  else f'SEND_DELAY_SECONDS={self.cfg.send_delay:g}s')
         return (f'🚀 Upload V2: BẬT (concurrency '
                 f'{self.upload_engine.governor.current}/{self.upload_engine.governor.maximum})\n'
-                f'   Đã đăng: {s["files"]} ({s["mib"]} MiB) · '
+                f'   Đã đăng (phiên này): {s["files"]} ({s["mib"]} MiB) · '
                 f'{s["mib_per_s"]} MiB/s · {s["files_per_min"]} file/phút\n'
                 f'   ACK TB: {s["avg_ack_s"]}s · FloodWait: {s["floodwaits"]} · '
                 f'duplicate: {s["duplicates"]}\n'
-                f'   Hàng đợi: {q}{fault}\n')
+                f'   Hàng đợi: {q}\n'
+                f'   Pacing: cố định từ {source} — V2 không tự đổi khoảng nghỉ; '
+                f'chỉ tuân thủ FloodWait\n'
+                f'   (số liệu trên là PHIÊN NÀY; lịch sử xem dòng "Đã đăng" ở trên){fault}\n')
+
+    async def _files_notice(self, group_name, expected):
+        """Single implementation for /files and its hidden /check alias."""
+        if group_name:
+            try:
+                rows, missing, total = inspect_group(self.db, group_name, expected)
+                await self._manual_notice(
+                    f'🧩 {group_name}: đã có {len(rows)}/{expected} phần; '
+                    f'tổng {total/1024**3:.2f} GiB. '
+                    + (f'Thiếu: {missing[:30]}' if missing
+                       else 'Đủ số thứ tự; chưa tải/kiểm tra CRC.'))
+            except ValueError as ex:
+                await self._manual_notice('⚠️ ' + str(ex))
+            return
+        rows = staged_rows(self.db)
+        display = '\n'.join(f'• {r["file_name"]} ({r["size_bytes"]/1024**2:.1f} MiB)'
+                            for r in rows[:15])
+        await self._manual_notice(f'📥 File chờ lệnh: {len(rows)}\n'
+                                  + (display or 'Không có file chờ')
+                                  + ('\n...và các file khác' if len(rows) > 15 else ''))
 
     async def handle_manual(self, msg):
         """Single room, authorized admin commands, no implicit download on upload."""
@@ -224,7 +249,8 @@ class Service:
         if review_command is not None:
             action, target = review_command
             if action == 'invalid':
-                await self._manual_notice('⚠️ Dùng /errors, /errorscsv, /errorsfiles, /errors 158 hoặc /errors <SHA256>.')
+                await self._manual_notice('⚠️ Dùng /errors, /errors csv, /errors files, /errors 158, /errors <SHA256> '
+                                          '(alias cũ: /errorscsv, /errorsfiles).')
                 return
             try:
                 rows = await asyncio.to_thread(query_held, self.cfg.data.parent,
@@ -256,51 +282,18 @@ class Service:
             if verb in ('start','help'):
                 await self._manual_notice(
                     '🤖 OUMIJIA — TRUNG TÂM ĐIỀU KHIỂN\n\n'
-                    '📦 QUẢN LÝ EDZ\n\n'
-                    '- "/files" — Xem file đang chờ duyệt.\n'
+                    '- "/help" — Xem hướng dẫn.\n'
+                    '- "/files" — Xem file chờ duyệt; thêm "Ten-goi.7z N" để kiểm tra bộ nén.\n'
                     '- "/process" — Duyệt tải và xử lý file.\n'
-                    '- "/cancel" — Hủy các file chưa bắt đầu.\n\n'
-                    '📊 HỆ THỐNG\n\n'
+                    '- "/cancel" — Hủy các file chưa bắt đầu.\n'
                     '- "/status" — Trạng thái EDZ, Upload V2 và tốc độ đăng.\n'
                     '- "/health" — CPU, RAM, SSD và dịch vụ.\n'
-                    '- "/errors" — Xem lỗi cần xử lý.\n\n'
-                    '⚙️ CÀI ĐẶT\n\n'
-                    '- "/limit" — Xem hoặc chỉnh khoảng nghỉ upload.\n'
-                    '- "/help" — Xem hướng dẫn.\n\n'
-                    'Lệnh mở rộng:\n\n'
-                    '- "/files ABC.7z 3" — Kiểm tra đủ 3 phần nén.\n'
-                    '- "/process ABC.7z 3" — Duyệt xử lý bộ nén.\n'
-                    '- "/errors 158" — Xem chi tiết lỗi.\n'
-                    '- "/errors csv" — Xuất báo cáo lỗi.\n'
-                    '- "/limit 3" — Nghỉ 3 giây giữa các lượt đăng.\n'
-                    '- "/limit reset" — Khôi phục mức nghỉ mặc định.\n\n'
+                    '- "/errors" — Xem lỗi; thêm "csv"/"files" để xuất báo cáo.\n\n'
                     '🔒 Chỉ quản trị viên được phép điều khiển. '
                     'File gửi vào nhóm chỉ được ghi nhận; cần "/process" để duyệt tải và xử lý.')
                 return
-            if verb == 'files':
-                rows = staged_rows(self.db)
-                display = '\n'.join(f'• {r["file_name"]} ({r["size_bytes"]/1024**2:.1f} MiB)'
-                                    for r in rows[:15])
-                await self._manual_notice(f'📥 File chờ lệnh: {len(rows)}\n'
-                                          + (display or 'Không có file chờ')
-                                          + ('\n...và các file khác' if len(rows)>15 else ''))
-                return
-            if verb == 'check':
-                if group_name:
-                    try:
-                        rows, missing, total = inspect_group(self.db, group_name, expected)
-                        await self._manual_notice(
-                            f'🧩 {group_name}: đã có {len(rows)}/{expected} phần; '
-                            f'tổng {total/1024**3:.2f} GiB. '
-                            + (f'Thiếu: {missing[:30]}' if missing else 'Đủ số thứ tự; chưa tải/kiểm tra CRC.')
-                        )
-                    except ValueError as ex:
-                        await self._manual_notice('⚠️ ' + str(ex))
-                else:
-                    n, parts, size = staged_summary(self.db)
-                    await self._manual_notice(
-                        f'🔎 Có {n} EDZ/7z độc lập và {parts} phần 7z đang chờ lệnh. '
-                        f'Tổng metadata: {size/1024**3:.2f} GiB. Chưa tải file nào từ hộp nhận.')
+            if verb in ('files', 'check'):
+                await self._files_notice(group_name, expected)
                 return
             if verb == 'process':
                 try:
@@ -335,7 +328,7 @@ class Service:
                 delay_source = 'Telegram /limit' if override_delay(self.db) is not None else 'SEND_DELAY_SECONDS'
                 await self._manual_notice(
                     '📊 OUMIJIA — Trạng thái\n'
-                    f'Đã đăng: {a.get("posted",0)}\n'
+                    f'📜 Lịch sử — Đã đăng: {a.get("posted",0)}\n'
                     f'Chờ đăng: {a.get("ready",0)}\n'
                     f'Lỗi giữ lại: {a.get("held",0)}\n'
                     f'File thủ công chưa duyệt: {staged[0]} file + {staged[1]} phần 7z\n'

@@ -272,6 +272,7 @@ def test_v2_status_block():
     from edzbot.upload_engine import UploadStats
     s = object.__new__(Service)
     s.db = DB(Path(':memory:'))
+    s.cfg = SimpleNamespace(send_delay=3.0)
     s.upload_engine = SimpleNamespace(
         stats=UploadStats(),
         governor=SimpleNamespace(current=1, maximum=1),
