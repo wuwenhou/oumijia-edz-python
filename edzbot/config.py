@@ -73,6 +73,7 @@ class Config:
     upload_max_concurrency: int
     upload_max_retries: int
     upload_temp_dir: str
+    upload_canary_name: str
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> 'Config':
@@ -140,6 +141,7 @@ class Config:
             upload_max_concurrency=int(os.getenv('UPLOAD_MAX_CONCURRENCY', '2')),
             upload_max_retries=int(os.getenv('UPLOAD_MAX_RETRIES', '3')),
             upload_temp_dir=os.getenv('UPLOAD_TEMP_DIR', '').strip(),
+            upload_canary_name=os.getenv('UPLOAD_CANARY_NAME', '').strip(),
         )
         if (cfg.max_archive_files < 1 or cfg.max_unpack_bytes < 1 or cfg.poll_seconds < 1
                 or cfg.max_group_bytes <= 0 or cfg.plan_max_pending_artifacts < 1

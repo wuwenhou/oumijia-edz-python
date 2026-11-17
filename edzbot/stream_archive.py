@@ -38,6 +38,7 @@ class ArchiveEntry:
     file_name: str
     size: int
     crc32: int | None          # None when the listing has no trustworthy CRC
+    is_edz: bool = True        # False for non-EDZ / nested members: consume, don't publish
 
 
 @dataclass
@@ -67,9 +68,13 @@ def _fields_from_block(block: str) -> dict[str, str]:
     return fields
 
 
-def list_edz_entries(sevenzip: str, archive: Path, *, max_files: int,
-                     max_bytes: int) -> list[ArchiveEntry]:
-    """`7z l -slt`: ordered .edz members with size + CRC (if present)."""
+def list_entries(sevenzip: str, archive: Path, *, max_files: int,
+                 max_bytes: int) -> list[ArchiveEntry]:
+    """`7z l -slt`: EVERY file member in archive order (size + CRC if present).
+
+    Non-EDZ and nested-EDZ members MUST stay in this list: `7z x -so` emits their
+    bytes too, and dropping them from the demux stride shifts every later file.
+    """
     p = subprocess.run([sevenzip, 'l', '-slt', '-sccUTF-8', str(archive)],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200)
     if p.returncode != 0:
@@ -83,21 +88,25 @@ def list_edz_entries(sevenzip: str, archive: Path, *, max_files: int,
             continue
         if not safe_member(name):
             raise ValueError('Unsafe path inside archive: ' + repr(name))
-        if not name.lower().endswith('.edz'):
-            continue
-        # Nested EDZ (a .edz inside another archive path) is intentionally skipped.
-        parts = name.replace('\\', '/').split('/')[:-1]
-        if any(part.lower().endswith('.edz') for part in parts):
-            continue
         size = int(f['Size'])
         if size < 0 or size > max_bytes:
-            raise ValueError('Invalid/oversized EDZ entry: ' + name)
+            raise ValueError('Invalid/oversized entry: ' + name)
         crc_raw = f.get('CRC', '').strip()
         crc = int(crc_raw, 16) if _CRC_RE.fullmatch(crc_raw) else None
-        entries.append(ArchiveEntry(name, Path(name.replace('\\', '/')).name, size, crc))
+        parts = name.replace('\\', '/').split('/')
+        is_edz = (parts[-1].lower().endswith('.edz')
+                  and not any(x.lower().endswith('.edz') for x in parts[:-1]))
+        entries.append(ArchiveEntry(name, parts[-1], size, crc, is_edz))
         if len(entries) > max_files:
             raise ValueError('Archive exceeds MAX_ARCHIVE_FILES')
     return entries
+
+
+def list_edz_entries(sevenzip: str, archive: Path, *, max_files: int,
+                     max_bytes: int) -> list[ArchiveEntry]:
+    """Convenience filter; do NOT use as the demux stride (see list_entries)."""
+    return [e for e in list_entries(sevenzip, archive, max_files=max_files,
+                                    max_bytes=max_bytes) if e.is_edz]
 
 
 def stream_edz(sevenzip: str, archive: Path, entries: list[ArchiveEntry], *,
@@ -116,9 +125,12 @@ def stream_edz(sevenzip: str, archive: Path, entries: list[ArchiveEntry], *,
     try:
         for entry in entries:
             if entry.size > max_bytes:
-                raise ValueError('EDZ exceeds streaming size cap: ' + entry.path)
+                raise ValueError('Entry exceeds streaming size cap: ' + entry.path)
             norm = normalize_edz_name(entry.file_name)
-            skip = norm in accepted_names
+            # Every member is consumed in listing order; only NEW top-level
+            # EDZs are kept. Non-EDZ/nested bytes are read and discarded so
+            # the solid stream stays aligned (preflight condition 3).
+            skip = (not entry.is_edz) or (norm in accepted_names)
             sha = hashlib.sha256()
             crc = 0
             total = 0

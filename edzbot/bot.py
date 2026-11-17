@@ -107,7 +107,8 @@ class Service:
                     concurrency=cfg.upload_concurrency,
                     max_concurrency=cfg.upload_max_concurrency,
                     max_retries=cfg.upload_max_retries,
-                    max_upload_bytes=cfg.max_upload_bytes),
+                    max_upload_bytes=cfg.max_upload_bytes,
+                    canary_name=cfg.upload_canary_name),
                 get_delay=lambda: current_delay(self.db, self.cfg),
                 sysinfo=lambda: server_snapshot(self.cfg.data, self.cfg.reserve_bytes),
             )
@@ -163,6 +164,18 @@ class Service:
         if not message_allowed(msg, self.inbox_allowed):
             return
         text = getattr(msg, 'raw_text', '') or ''
+        # Admin-only: stream an already-staged 7z through the V2 publisher.
+        if text.strip().lower().startswith('/stream7z '):
+            arg = text.strip().split(None, 1)[1]
+            try:
+                result = await self.publish_archive_v2(Path(arg))
+                await self._manual_notice(
+                    f'✅ V2 stream 7z: entries={result["entries"]}, '
+                    f'posted={result["posted"]}, skipped={result["skipped"]}')
+            except Exception as ex:
+                log.exception('V2 archive stream command failed')
+                await self._manual_notice('⚠️ V2 stream 7z thất bại: ' + str(ex)[:300])
+            return
         # OUMIJIA_REVIEW_CSV_V023: admin-only read-only report requests
         from .review_reports import (parse_request, query_held, csv_bytes,
                                      summary_text, detail_text, send_document)
@@ -219,6 +232,7 @@ class Service:
                     '/uptime — Thời gian server hoạt động.\n'
                     '/speed — Mức nghỉ hiện tại và nguồn cấu hình.\n'
                     '/v2stats — Thống kê Upload Engine V2 (nếu bật).\n'
+                    '/stream7z <đường dẫn trong DATA_DIR> — Stream 7z qua V2.\n'
                     '/limit N — Khoảng nghỉ giữa 2 EDZ (giây); 0 = không giới hạn.\n'
                     '/limit reset — Bỏ ghi đè, quay về SEND_DELAY_SECONDS (mặc định 3).\n'
                     '/errors — Tổng hợp các loại lỗi đang held.\n'
@@ -576,6 +590,24 @@ class Service:
                 f'✅ OUMIJIA — Đã ghép và kiểm tra xong {group[7:]}; '
                 f'phát hiện {count} EDZ mới đã sẵn sàng để đăng. '
                 'Các file trùng được bỏ qua.')
+
+    async def publish_archive_v2(self, archive: Path) -> dict:
+        """Real-pipeline integration: stream one 7z straight into the V2 queue.
+
+        No whole-archive extraction; EDZs are enqueued and posted by the SAME
+        single publisher. Restricted to archives already under DATA_DIR.
+        """
+        if self.upload_engine is None:
+            raise RuntimeError('Upload Engine V2 is disabled')
+        from .upload_engine import publish_archive
+        archive = Path(archive).resolve()
+        root = self.cfg.data.resolve()
+        if root not in archive.parents:
+            raise ValueError('Archive must already live under DATA_DIR')
+        temp = self.cfg.data / 'work' / 'v2stream'
+        return await publish_archive(self.upload_engine, self.cfg.sevenzip, archive,
+                                     temp_dir=temp, max_files=self.cfg.max_archive_files,
+                                     max_bytes=self.cfg.max_unpack_bytes)
 
     def caption(self, a):
         brand, part = a['brand'], a['part_number'] or 'Unknown'
@@ -1016,8 +1048,9 @@ class Service:
         """SINGLE publisher; preserve SHA, FloodWait, and ambiguous-send guards."""
         log.info('PIPELINE v16.3 Publisher started')
         if self.upload_engine is not None:
-            log.info('Upload Engine V2 active (concurrency=%d/%d)',
-                     self.cfg.upload_concurrency, self.cfg.upload_max_concurrency)
+            log.info('Upload Engine V2 active (concurrency=%d/%d, canary=%s)',
+                     self.cfg.upload_concurrency, self.cfg.upload_max_concurrency,
+                     self.cfg.upload_canary_name or 'OFF')
             while True:
                 try:
                     await self.upload_engine.publish_batch()

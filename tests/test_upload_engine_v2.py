@@ -4,10 +4,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from pathlib import Path
+import subprocess
 import unicodedata
+import zlib
 
 import pytest
 
+from edzbot import stream_archive as sa
 from edzbot.db import DB
 from edzbot.upload_engine import (UploadEngine, EngineConfig, AdaptiveGovernor,
                                   UploadStats, build_caption)
@@ -54,17 +57,28 @@ def make_engine(db, client=None, **cfgkw):
     return UploadEngine(db, client or FakeClient(), 'TARGET', cfg=make_cfg(**cfgkw))
 
 
+def make_popen(data):
+    class FakeProc:
+        def __init__(self, *a, **k):
+            self.stdout = __import__('io').BytesIO(data)
+            self.stderr = __import__('io').BytesIO(b'')
+        def wait(self, timeout=None): return 0
+        def poll(self): return 0
+        def kill(self): pass
+    return FakeProc
+
+
 def job(name, sha, size=10, path='/tmp/x.edz'):
     return {'normalized_name': unicodedata.normalize('NFC', name).lower(),
             'sha256': sha, 'file_name': name, 'path': path,
             'size_bytes': size, 'source_message': None, 'brand': None, 'part': None}
 
 
-def insert_art(db, sha):
+def insert_art(db, sha, name='Ack.edz'):
     db.execute("INSERT INTO artifacts(sha256,file_name,path,size_bytes,source_message,"
                "origin,brand,part_number,validation,state,created_at,updated_at) "
                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-               (sha, 'Ack.edz', '/tmp/ack', 10, 0, 'direct', '', '', 'ok', 'posting', 0, 0))
+               (sha, name, '/tmp/ack', 10, 0, 'direct', '', '', 'ok', 'posting', 0, 0))
 
 
 # --- 1. name normalization convention -------------------------------------
@@ -116,7 +130,7 @@ def test_ack_updates_all_in_one_txn():
 
 def test_ack_works_on_legacy_db_without_normalized_name():
     db = fresh_db(legacy=True)
-    insert_art(db, '9' * 64)
+    insert_art(db, '9' * 64, name='Legacy.edz')
     e = make_engine(db)
     e.enqueue('Legacy.edz', '9' * 64, '/tmp/ack', 10)
     e.ack(dict(db.execute('SELECT * FROM upload_jobs').fetchone()), 55)
@@ -248,3 +262,141 @@ def test_media_reuse_avoids_reupload(tmp_path):
     p.write_bytes(b'x' * 10)
     assert asyncio.run(e.publish(j)) is True
     assert client.calls[0][1] is media
+
+
+# ===========================================================================
+# PREFLIGHT (approved canary) -- 5 mandatory conditions
+# ===========================================================================
+def test_preflight1_ack_same_sha_different_name_keeps_other_artifact():
+    db = fresh_db()
+    sha = 'a' * 64
+    db.execute("INSERT INTO artifacts(sha256,file_name,path,size_bytes,source_message,"
+               "origin,brand,part_number,validation,state,normalized_name,created_at,updated_at)"
+               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (sha, 'Alpha.edz', '/tmp/alpha', 10, 0, 'direct', '', '', 'ok',
+                'ready', 'alpha.edz', 0, 0))
+    e = make_engine(db)
+    e.enqueue('Beta.edz', sha, '/tmp/beta', 10)      # same SHA, different name
+    beta = dict(db.execute("SELECT * FROM upload_jobs WHERE normalized_name='beta.edz'").fetchone())
+    e.ack(beta, 888)
+    art = db.execute('SELECT state,target_message,normalized_name FROM artifacts').fetchone()
+    assert art['state'] == 'ready' and art['target_message'] is None
+    assert art['normalized_name'] == 'alpha.edz'
+    assert db.execute("SELECT 1 FROM upload_events WHERE kind='ack_name_mismatch'").fetchone()
+    # The correct owner still ACKs cleanly.
+    e.enqueue('Alpha.edz', sha, '/tmp/alpha', 10)
+    alpha = dict(db.execute("SELECT * FROM upload_jobs WHERE normalized_name='alpha.edz'").fetchone())
+    e.ack(alpha, 889)
+    art = db.execute('SELECT state,target_message FROM artifacts').fetchone()
+    assert art['state'] == 'posted' and art['target_message'] == 889
+
+
+def test_preflight2_enqueue_is_atomic_on_failure(monkeypatch):
+    db = fresh_db()
+    e = make_engine(db)
+    real_execute = db.execute
+    def flaky(sql, args=()):
+        if 'INTO upload_jobs' in sql:
+            raise RuntimeError('disk full mid-enqueue')
+        return real_execute(sql, args)
+    monkeypatch.setattr(db, 'execute', flaky)
+    with pytest.raises(RuntimeError):
+        e.enqueue('Atomic.edz', 'b' * 64, '/tmp/a', 10)
+    # Both the owner claim and the event must be rolled back.
+    assert db.execute('SELECT COUNT(*) FROM upload_name_owners').fetchone()[0] == 0
+    assert db.execute('SELECT COUNT(*) FROM upload_events').fetchone()[0] == 0
+
+
+def test_preflight2_concurrent_enqueue_one_winner(tmp_path):
+    path = tmp_path / 'race.sqlite3'
+    db1, db2 = DB(path), DB(path)
+    e1 = UploadEngine(db1, FakeClient(), 'T', cfg=make_cfg())
+    e2 = UploadEngine(db2, FakeClient(), 'T', cfg=make_cfg())
+    assert e1.enqueue('Race.edz', 'c' * 64, '/tmp/r', 10) is True
+    assert e2.enqueue('RACE.edz', 'd' * 64, '/tmp/r2', 10) is False
+    assert db1.execute('SELECT COUNT(*) FROM upload_jobs').fetchone()[0] == 1
+    db1.close(); db2.close()
+
+
+def test_preflight3_non_edz_member_does_not_shift_stream(monkeypatch, tmp_path):
+    from edzbot.stream_archive import list_entries, stream_edz
+    a, note, b = b'AAAAAAAA', b'NOTES!!', b'BBBB'
+    def blk2(path, data):
+        return f'Path = {path}\nSize = {len(data)}\nCRC = {zlib.crc32(data):X}\n'
+    fake = subprocess.CompletedProcess([], 0, '\n\n'.join(
+        [blk2('A.edz', a), blk2('notes.txt', note), blk2('B.edz', b)]).encode(), b'')
+    monkeypatch.setattr(sa.subprocess, 'run', lambda *x, **k: fake)
+    monkeypatch.setattr(sa.subprocess, 'Popen', make_popen(a + note + b))
+    entries = list_entries('7z', Path('a.7z'), max_files=100, max_bytes=1 << 20)
+    assert [e.file_name for e in entries] == ['A.edz', 'notes.txt', 'B.edz']
+    items = list(stream_edz('7z', Path('a.7z'), entries, accepted_names=set(),
+                            temp_dir=tmp_path, max_bytes=1 << 20))
+    assert [i.name for i in items] == ['A.edz', 'B.edz']
+    assert items[0].path.read_bytes() == a      # not corrupted by 'notes.txt'
+    assert items[1].path.read_bytes() == b
+    for i in items:
+        i.cleanup()
+
+
+def test_preflight4_pipeline_stream_to_queue(tmp_path):
+    """7z -> stream -> enqueue -> publish -> ACK, end to end on file-backed DB."""
+    from edzbot.stream_archive import list_entries, stream_edz
+    payload = b'PIPELINE-EDZ-BYTES'
+    dbpath = tmp_path / 'pipe.sqlite3'
+    db = DB(dbpath)
+    fake = subprocess.CompletedProcess([], 0,
+        f'Path = PIPE.edz\nSize = {len(payload)}\nCRC = {zlib.crc32(payload):X}\n'.encode(), b'')
+    monkeypatch_run = fake
+    # patch at call time via a small wrapper object
+    import edzbot.stream_archive as _sa
+    old_run, old_popen = _sa.subprocess.run, _sa.subprocess.Popen
+    _sa.subprocess.run = lambda *x, **k: fake
+    _sa.subprocess.Popen = make_popen(payload)
+    try:
+        e = UploadEngine(db, FakeClient(), 'T', cfg=make_cfg())
+        entries = list_entries('7z', Path('a.7z'), max_files=100, max_bytes=1 << 20)
+        for item in stream_edz('7z', Path('a.7z'), entries, accepted_names=set(),
+                               temp_dir=tmp_path, max_bytes=1 << 20):
+            assert e.enqueue(item.name, item.sha256, str(item.path), item.size)
+            j = e.claim_next()
+            assert asyncio.run(e.publish(j)) is True
+            item.cleanup()
+        assert db.execute("SELECT COUNT(*) FROM upload_jobs WHERE state='posted'").fetchone()[0] == 1
+    finally:
+        _sa.subprocess.run, _sa.subprocess.Popen = old_run, old_popen
+        db.close()
+
+
+def test_preflight5_ambiguous_never_auto_resends():
+    db = fresh_db()
+    client = FakeClient(fail=RuntimeError('unknown outcome'))
+    e = make_engine(db, client)
+    e.enqueue('NoRetry.edz', 'e' * 64, '/nonexistent', 10)  # held at pre-send
+    # Force a genuinely ambiguous SEND outcome instead.
+    p = Path('/tmp/nr.edz'); p.write_bytes(b'q' * 10)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    e.enqueue('NoRetry2.edz', digest, str(p), 10)   # new name (owner was already claimed)
+    j = dict(db.execute("SELECT * FROM upload_jobs WHERE normalized_name='noretry2.edz'").fetchone())
+    j['source_message'] = None
+    # ambiguous on send
+    client.fail = TimeoutError('ACK lost after Telegram accepted')
+    assert asyncio.run(e.publish(j)) is False
+    assert db.execute("SELECT state FROM upload_jobs").fetchone()[0] == 'held'
+    before = len(client.calls)
+    asyncio.run(e.publish_batch())
+    asyncio.run(e.publish_batch())
+    assert len(client.calls) == before      # no auto-resend across scheduler ticks
+
+
+def test_canary_gate_blocks_backlog():
+    db = fresh_db()
+    for i in range(3):
+        db.execute("INSERT INTO artifacts(sha256,file_name,path,size_bytes,source_message,"
+                   "origin,brand,part_number,validation,state,created_at,updated_at)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (str(i) * 64, f'f{i}.edz', f'/tmp/f{i}', 10, 0, 'direct', '', '',
+                    'ok', 'ready', 0, 0))
+    e = UploadEngine(db, FakeClient(), 'T', cfg=make_cfg(canary_name='F1.EDZ'))
+    assert e.enqueue_ready_artifacts() == 1
+    assert e.claim_next()['normalized_name'] == 'f1.edz'
+    assert e.claim_next() is None          # nothing else may start

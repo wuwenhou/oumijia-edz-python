@@ -127,6 +127,7 @@ class EngineConfig:
     max_retries: int = 3           # bounded retries only for pre-send safe failures
     max_upload_bytes: int = 2 * 1024**3
     success_streak: int = 25
+    canary_name: str = ''          # if set, ONLY this normalized name may be published
 
 
 class UploadEngine:
@@ -143,6 +144,7 @@ class UploadEngine:
         self.governor = AdaptiveGovernor(initial=self.cfg.concurrency,
                                          maximum=self.cfg.max_concurrency,
                                          success_streak=self.cfg.success_streak)
+        self.canary_name = normalize_edz_name(self.cfg.canary_name) if self.cfg.canary_name else None
         self.stats = UploadStats(sysinfo=sysinfo)
 
     # ---- durability / dedup ------------------------------------------------
@@ -172,24 +174,44 @@ class UploadEngine:
     def enqueue(self, name: str, sha: str, path: str, size: int,
                 *, source_message: int | None = None, brand: str | None = None,
                 part: str | None = None) -> bool:
-        """Claim the name then durably enqueue a job. No-op on duplicate name."""
+        """Atomically claim the name AND enqueue the job in ONE transaction.
+
+        A crash between the two statements would otherwise leave an owned name
+        with no job (artifact silently never published) -- preflight condition 2.
+        """
         norm = normalize_edz_name(name)
-        # Legacy guard: never enqueue something already accepted/posted.
-        if self._table('edz_name_catalog') and self.db.execute(
-                "SELECT 1 FROM edz_name_catalog WHERE normalized_name=? AND state='accepted'",
-                (norm,)).fetchone():
-            self.stats.duplicates += 1
-            return False
-        if not self.claim_name(name, sha, size, source_message):
-            return False
-        self.db.execute(
-            'INSERT OR IGNORE INTO upload_jobs'
-            '(normalized_name,sha256,file_name,path,size_bytes,source_message,state,created_at,updated_at)'
-            ' VALUES(?,?,?,?,?,?,?,?,?)',
-            (norm, sha, name, str(path), int(size), source_message, 'queued',
-             time.time(), time.time()))
-        self._event(norm, 'enqueued', f'sha={sha[:16]} size={size}')
-        return True
+        now = time.time()
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            # Legacy guard: never enqueue something already accepted/posted.
+            if self._table('edz_name_catalog') and self.db.execute(
+                    "SELECT 1 FROM edz_name_catalog WHERE normalized_name=? AND state='accepted'",
+                    (norm,)).fetchone():
+                self.db.execute('ROLLBACK')
+                self.stats.duplicates += 1
+                return False
+            cur = self.db.execute(
+                'INSERT OR IGNORE INTO upload_name_owners'
+                '(normalized_name,sha256,file_name,size_bytes,source_message,created_at)'
+                ' VALUES(?,?,?,?,?,?)',
+                (norm, sha, name, int(size), source_message, now))
+            if cur.rowcount != 1:
+                self.db.execute('ROLLBACK')
+                self.stats.duplicates += 1
+                return False
+            self.db.execute(
+                'INSERT OR IGNORE INTO upload_jobs'
+                '(normalized_name,sha256,file_name,path,size_bytes,source_message,state,created_at,updated_at)'
+                ' VALUES(?,?,?,?,?,?,?,?,?)',
+                (norm, sha, name, str(path), int(size), source_message, 'queued', now, now))
+            self.db.execute(
+                'INSERT INTO upload_events(at,normalized_name,kind,detail) VALUES(?,?,?,?)',
+                (now, norm, 'enqueued', f'sha={sha[:16]} size={size}'))
+            self.db.execute('COMMIT')
+            return True
+        except Exception:
+            self.db.execute('ROLLBACK')
+            raise
 
     def enqueue_ready_artifacts(self) -> int:
         """Bridge the existing 'ready' artifacts into the durable queue."""
@@ -197,6 +219,9 @@ class UploadEngine:
         rows = self.db.execute(
             "SELECT * FROM artifacts WHERE state='ready' ORDER BY created_at").fetchall()
         for a in rows:
+            # Canary mode: never let the backlog auto-start on service boot.
+            if self.canary_name and normalize_edz_name(a['file_name']) != self.canary_name:
+                continue
             if self.enqueue(a['file_name'], a['sha256'], a['path'], a['size_bytes'],
                             source_message=a['source_message'],
                             brand=a['brand'], part=a['part_number']):
@@ -207,8 +232,13 @@ class UploadEngine:
         """Atomically move one queued job to 'posting'. Safe across restarts."""
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            row = self.db.execute(
-                "SELECT * FROM upload_jobs WHERE state='queued' ORDER BY created_at LIMIT 1").fetchone()
+            if self.canary_name:
+                row = self.db.execute(
+                    "SELECT * FROM upload_jobs WHERE state='queued' AND normalized_name=? "
+                    "LIMIT 1", (self.canary_name,)).fetchone()
+            else:
+                row = self.db.execute(
+                    "SELECT * FROM upload_jobs WHERE state='queued' ORDER BY created_at LIMIT 1").fetchone()
             if row is None:
                 self.db.execute('COMMIT')
                 return None
@@ -230,20 +260,34 @@ class UploadEngine:
             self.db.execute(
                 "UPDATE upload_jobs SET state='posted', target_message=?, error=NULL, updated_at=? "
                 "WHERE normalized_name=?", (int(target_message), now, norm))
-            # The artifacts row may not exist (archive-sourced name) and older
-            # Python DBs lack normalized_name -- never assume the column exists.
-            if self.db.execute(
-                    "SELECT 1 FROM pragma_table_info('artifacts') WHERE name='normalized_name'"
-            ).fetchone():
-                self.db.execute(
-                    "UPDATE artifacts SET state='posted', target_message=?, normalized_name=?, "
-                    "error=NULL, updated_at=? WHERE sha256=?",
-                    (int(target_message), norm, now, job['sha256']))
-            else:
-                self.db.execute(
-                    "UPDATE artifacts SET state='posted', target_message=?, "
-                    "error=NULL, updated_at=? WHERE sha256=?",
-                    (int(target_message), now, job['sha256']))
+            # artifacts.sha256 is a PRIMARY KEY: at most ONE row per digest. If
+            # that row belongs to a DIFFERENT name sharing this SHA, it is a
+            # separate artifact and must NOT be marked posted/renamed here
+            # (preflight condition 1). Name identity lives in the V2 tables.
+            has_norm = bool(self.db.execute(
+                "SELECT 1 FROM pragma_table_info('artifacts') WHERE name='normalized_name'"
+            ).fetchone())
+            art = self.db.execute(
+                "SELECT file_name, normalized_name FROM artifacts WHERE sha256=?",
+                (job['sha256'],)).fetchone() if has_norm else self.db.execute(
+                "SELECT file_name FROM artifacts WHERE sha256=?",
+                (job['sha256'],)).fetchone()
+            if art is not None:
+                art_norm = normalize_edz_name(
+                    art['normalized_name'] or art['file_name'] if has_norm else art['file_name'])
+                if art_norm != norm:
+                    self._event(norm, 'ack_name_mismatch',
+                                f'artifact belongs to {art_norm}; left untouched')
+                elif has_norm:
+                    self.db.execute(
+                        "UPDATE artifacts SET state='posted', target_message=?, normalized_name=?, "
+                        "error=NULL, updated_at=? WHERE sha256=?",
+                        (int(target_message), norm, now, job['sha256']))
+                else:
+                    self.db.execute(
+                        "UPDATE artifacts SET state='posted', target_message=?, "
+                        "error=NULL, updated_at=? WHERE sha256=?",
+                        (int(target_message), now, job['sha256']))
             if self._table('edz_name_catalog'):
                 self.db.execute(
                     "UPDATE edz_name_catalog SET state='accepted' WHERE normalized_name=?",
@@ -398,8 +442,9 @@ async def publish_archive(engine: UploadEngine, sevenzip: str, archive: Path, *,
     Only one bounded temp file is alive at a time: enqueue -> claim -> publish
     -> cleanup before the next member is decoded. No whole-archive extraction.
     """
-    from .stream_archive import list_edz_entries, stream_edz
-    entries = list_edz_entries(sevenzip, archive, max_files=max_files, max_bytes=max_bytes)
+    from .stream_archive import list_entries, stream_edz
+    # Full member list is the demux stride: non-EDZ members are consumed too.
+    entries = list_entries(sevenzip, archive, max_files=max_files, max_bytes=max_bytes)
     accepted = _accepted_names(engine.db)
     posted = skipped = 0
     for item in stream_edz(sevenzip, archive, entries, accepted_names=accepted,
