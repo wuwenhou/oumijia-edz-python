@@ -30,6 +30,7 @@ from .manual_inbox import (stage as stage_manual, activate_singles, activate_gro
                            parse_command, message_allowed)
 from .bot_notifications import send as bot_send
 from .server_monitor import snapshot as server_snapshot, format_snapshot
+from .upload_engine import UploadEngine, EngineConfig
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,20 @@ class Service:
         self.target = None
         self.inbox = None
         self.inbox_allowed = cfg.inbox_user_ids
+        self.upload_engine = None
+        if cfg.upload_engine_v2:
+            self.upload_engine = UploadEngine(
+                self.db, self.client, None,   # resolved entities assigned in run()
+                source=None,
+                cfg=EngineConfig(
+                    concurrency=cfg.upload_concurrency,
+                    max_concurrency=cfg.upload_max_concurrency,
+                    max_retries=cfg.upload_max_retries,
+                    max_upload_bytes=cfg.max_upload_bytes),
+                get_delay=lambda: current_delay(self.db, self.cfg),
+                sysinfo=lambda: server_snapshot(self.cfg.data, self.cfg.reserve_bytes),
+            )
+            self.upload_engine.recover_posting()
 
     def enqueue(self, msg):
         if getattr(msg, 'noforwards', False):
@@ -203,6 +218,7 @@ class Service:
                     '/disk — Dung lượng SSD đã dùng/còn trống, dự phòng 40 GiB.\n'
                     '/uptime — Thời gian server hoạt động.\n'
                     '/speed — Mức nghỉ hiện tại và nguồn cấu hình.\n'
+                    '/v2stats — Thống kê Upload Engine V2 (nếu bật).\n'
                     '/limit N — Khoảng nghỉ giữa 2 EDZ (giây); 0 = không giới hạn.\n'
                     '/limit reset — Bỏ ghi đè, quay về SEND_DELAY_SECONDS (mặc định 3).\n'
                     '/errors — Tổng hợp các loại lỗi đang held.\n'
@@ -280,6 +296,24 @@ class Service:
                     f'(nguồn: {delay_source}; 0 = không giới hạn)\n'
                     + self._pipeline_status_short_v163()
                     + f'Telegram yêu cầu chờ thêm: {round(cooldown_remaining(self.db))} giây')
+                return
+            if verb == 'v2stats':
+                if self.upload_engine is None:
+                    await self._manual_notice('Upload Engine V2 chưa được bật (UPLOAD_ENGINE_V2=false).')
+                else:
+                    s = self.upload_engine.stats.snapshot()
+                    q = {r['state']: r['n'] for r in self.db.execute(
+                        "SELECT state,COUNT(*) n FROM upload_jobs GROUP BY state").fetchall()}
+                    await self._manual_notice(
+                        '⚙️ OUMIJIA — Upload Engine V2\n'
+                        f'Concurrency: {self.upload_engine.governor.current}/'
+                        f'{self.upload_engine.governor.maximum}\n'
+                        f'Đã đăng: {s["files"]} ({s["mib"]} MiB), {s["mib_per_s"]} MiB/s, '
+                        f'{s["files_per_min"]} file/phút\n'
+                        f'ACK trung bình: {s["avg_ack_s"]}s\n'
+                        f'FloodWait: {s["floodwaits"]}, duplicate: {s["duplicates"]}, '
+                        f'retry: {s["retries"]}\n'
+                        f'Hàng đợi: {q}')
                 return
             if verb in ('server', 'health', 'cpu', 'ram', 'disk', 'uptime'):
                 try:
@@ -904,7 +938,8 @@ class Service:
             await self.process_volume_groups()
             a = self.db.next_artifact(allow_unverified=self.cfg.allow_unverified,
                                       require_complete_source=self.cfg.auto_mode)
-            if a and not self.cfg.dry_run and next_send_remaining(self.db) <= 0:
+            if (a and not self.cfg.dry_run and self.upload_engine is None
+                    and next_send_remaining(self.db) <= 0):
                 await self.publish_one(a)
                 continue
             await asyncio.sleep(self.cfg.poll_seconds)
@@ -980,6 +1015,17 @@ class Service:
     async def publish_worker_v163(self):
         """SINGLE publisher; preserve SHA, FloodWait, and ambiguous-send guards."""
         log.info('PIPELINE v16.3 Publisher started')
+        if self.upload_engine is not None:
+            log.info('Upload Engine V2 active (concurrency=%d/%d)',
+                     self.cfg.upload_concurrency, self.cfg.upload_max_concurrency)
+            while True:
+                try:
+                    await self.upload_engine.publish_batch()
+                except Exception:
+                    log.exception('Upload Engine V2 batch failed; state preserved for recovery')
+                    await asyncio.sleep(10)
+                await asyncio.sleep(min(1, max(0.5, self.cfg.poll_seconds)))
+            return
         while True:
             remaining = next_send_remaining(self.db)
             if remaining > 0:
@@ -1022,6 +1068,9 @@ class Service:
             await self.client.get_dialogs(limit=250)
             self.source = await self.client.get_entity(self.cfg.source)
             self.target = await self.client.get_entity(self.cfg.target)
+            if self.upload_engine is not None:
+                self.upload_engine.target = self.target
+                self.upload_engine.source = self.source
             if self.cfg.inbox_chat is not None:
                 self.inbox = await self.client.get_entity(self.cfg.inbox_chat)
                 if self.inbox.id in (self.source.id, self.target.id):

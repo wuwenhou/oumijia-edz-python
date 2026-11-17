@@ -15,9 +15,9 @@ _NAME_CACHE: dict[int, tuple[int, frozenset[str]]] = {}
 
 
 def normalize_edz_name(name: str) -> str:
-    """Canonical identity: basename, Unicode NFC, case-folded (spec V.2)."""
+    """Canonical identity: basename, Unicode NFC + casefold (spec V.2 / V5)."""
     base = Path(str(name)).name
-    return unicodedata.normalize("NFC", base).lower()
+    return unicodedata.normalize("NFC", base).casefold()
 
 
 def _confirmed_names(db) -> frozenset[str]:

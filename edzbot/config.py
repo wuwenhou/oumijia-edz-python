@@ -67,6 +67,12 @@ class Config:
     send_delay: float
     source_scan_enabled: bool
     log_level: str
+    # Upload Engine V2 (opt-in; default off keeps the legacy publisher intact).
+    upload_engine_v2: bool
+    upload_concurrency: int
+    upload_max_concurrency: int
+    upload_max_retries: int
+    upload_temp_dir: str
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> 'Config':
@@ -129,6 +135,11 @@ class Config:
             send_delay=float(os.getenv('SEND_DELAY_SECONDS', '3')), 
             log_level=os.getenv('LOG_LEVEL', 'INFO').upper(),
             source_scan_enabled=_boolean('EDZ_SOURCE_SCAN_ENABLED', False),
+            upload_engine_v2=_boolean('UPLOAD_ENGINE_V2', False),
+            upload_concurrency=int(os.getenv('UPLOAD_CONCURRENCY', '1')),
+            upload_max_concurrency=int(os.getenv('UPLOAD_MAX_CONCURRENCY', '2')),
+            upload_max_retries=int(os.getenv('UPLOAD_MAX_RETRIES', '3')),
+            upload_temp_dir=os.getenv('UPLOAD_TEMP_DIR', '').strip(),
         )
         if (cfg.max_archive_files < 1 or cfg.max_unpack_bytes < 1 or cfg.poll_seconds < 1
                 or cfg.max_group_bytes <= 0 or cfg.plan_max_pending_artifacts < 1
@@ -142,6 +153,12 @@ class Config:
             raise ValueError('Invalid EDZ pipeline limits')
         if cfg.continuous_pipeline and not cfg.auto_mode:
             raise ValueError('EDZ_CONTINUOUS_PIPELINE=true requires AUTO_MODE=true')
+        if (cfg.upload_engine_v2 and
+                (not 1 <= cfg.upload_concurrency <= 2 or
+                 not 1 <= cfg.upload_max_concurrency <= 2 or
+                 cfg.upload_concurrency > cfg.upload_max_concurrency or
+                 cfg.upload_max_retries < 0)):
+            raise ValueError('UPLOAD_* limits: concurrency must be 1 or 2, retries >= 0')
         # Single private control group. The BotFather bot replies in that same room.
         if cfg.inbox_chat is not None:
             if not isinstance(cfg.inbox_chat, int) or cfg.inbox_chat >= 0:

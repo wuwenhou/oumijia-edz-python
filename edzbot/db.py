@@ -50,6 +50,35 @@ CREATE TABLE IF NOT EXISTS plan_batch_sources (
     PRIMARY KEY (batch_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_plan_batch_id ON plan_batch_sources(batch_id);
+-- V2 upload engine: name-owned artifacts, durable queue and audit.
+-- Additive only; artifacts.sha256 PRIMARY KEY is NOT changed.
+CREATE TABLE IF NOT EXISTS upload_name_owners (
+    normalized_name TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    source_message INTEGER,
+    created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS upload_jobs (
+    normalized_name TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    source_message INTEGER,
+    state TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    target_message INTEGER,
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_upload_jobs_state ON upload_jobs(state, created_at);
+CREATE TABLE IF NOT EXISTS upload_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    normalized_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '');
 """
 
 
