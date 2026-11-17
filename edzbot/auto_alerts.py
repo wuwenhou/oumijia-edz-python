@@ -122,6 +122,17 @@ def next_alert(db) -> tuple[str, str] | None:
                             f'File: {row["file_name"]}\nNguồn: #{row["source_message"]}\n'
                             f'SHA256: {row["sha256"]}\nNguyên nhân: {vi_reason(reason)}\n'
                             'Trạng thái: Giữ lại file này; các file hợp lệ khác tiếp tục được xử lý.'))
+    # V2 held jobs live in upload_jobs, NOT in artifacts. Without this loop a
+    # failed or ambiguous upload is silent in both /errors and Control Bot.
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='upload_jobs'").fetchone():
+        for row in db.execute("""SELECT normalized_name,sha256,file_name,source_message,error
+                                 FROM upload_jobs WHERE state='held' ORDER BY created_at LIMIT 10000"""):
+            reason = row['error'] or 'Unknown upload job error'
+            key = 'v2job:' + row['normalized_name'] + ':' + hashlib.sha256(reason.encode()).hexdigest()
+            events.append((key, f'⚠️ OUMIJIA — LỖI UPLOAD V2 CẦN ĐỐI SOÁT\n'
+                                f'File: {row["file_name"]}\nNguồn: #{row["source_message"]}\n'
+                                f'SHA256: {row["sha256"]}\nNguyên nhân: {vi_reason(reason)}\n'
+                                'Trạng thái: job held; KHÔNG tự retry, cần đối soát kênh đích.'))
     for row in db.execute('SELECT issue_key,text FROM auto_issues ORDER BY created_at LIMIT 10000'):
         events.append(('internal:' + row['issue_key'],
                        '⚠️ OUMIJIA — LỖI HỆ THỐNG\n' + vi_reason(row['text']) + '\nThông tin kỹ thuật: ' + row['text'][:250]))

@@ -118,6 +118,10 @@ def query_held(root: Path, *, existing_only=False) -> list[dict]:
         queries = (
             ('source', "SELECT id AS source_id, NULL AS sha256, file_name, local_path AS path, error FROM messages WHERE state='held' ORDER BY id"),
             ('artifact', "SELECT source_message AS source_id, sha256, file_name, path, error FROM artifacts WHERE state='held' ORDER BY source_message, sha256"),
+            # Upload Engine V2 holds its own jobs; they must be visible in the
+            # same admin report (and in /errors csv), never silently hidden.
+            ('v2_job', "SELECT source_message AS source_id, sha256, file_name, path, error "
+                       "FROM upload_jobs WHERE state='held' ORDER BY created_at"),
         )
         for kind, sql in queries:
             for rec in db.execute(sql):
@@ -128,6 +132,7 @@ def query_held(root: Path, *, existing_only=False) -> list[dict]:
                 error = rec['error'] or ''
                 category = classify(error)
                 caption = (f'FIX_SOURCE:{rec["source_id"]}' if kind == 'source'
+                           else f'FIX_V2JOB:{rec["file_name"]}' if kind == 'v2_job'
                            else f'FIX_ARTIFACT:{sha}')
                 result.append({
                     'type': kind,
