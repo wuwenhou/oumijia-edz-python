@@ -229,6 +229,49 @@ Commit đã kiểm thử và deploy: **`cfa21580a3b56ebefd2f16dec070fdb589a72ea4
 - Caption brand hiển thị `EPLAN EDZ | EPLAN EDZ` (artifact `origin=generated` không
   có brand) — cosmetic, không ảnh hưởng định danh SHA/EDZID.
 
+## 5d. FULL ROLLOUT — ĐÃ KÍCH HOẠT (2026-11-17 03:25 UTC)
+
+Commit deploy: **`124843c8b81fd37b5720913b4cc43a051a05ad6c`** (147/147 test PASS).
+
+### Thay đổi code cho full rollout
+- `PUBLISHER_MODE=normal` + `UPLOAD_ENGINE_V2=true` được phép; `normal` + V2=false
+  bị **từ chối** (không bao giờ hồi sinh V1).
+- `ack()` giờ **INSERT/UPDATE `edz_name_catalog`** trong cùng transaction → mọi
+  tên đã đăng đều có row `state='accepted'` (117.123 → 117.293).
+- Fault lock SQLite bền vững: lỗi sqlite3 → ghi `upload_engine_fault` → publisher
+  khóa cả sau restart cho tới khi operator clear. Test fail-closed PASS.
+
+### Triển khai
+- Backup: `data/backups/20261117-v2-full-rollout/` (Backup API, quick_check ok,
+  sha `84e9d21c…`), kèm source/`.env`/systemd unit.
+- Config: `PUBLISHER_MODE=normal`, V2=true, 1/1, canary trống, archive stream
+  false, source scan false, `SEND_DELAY_SECONDS=3`.
+- Restart **1 lần**: PID **4050186**, NRestarts=0. Log:
+  `Publisher started (mode=normal)`, `Upload Engine V2 active (concurrency=1/1, canary=OFF)`.
+- Chỉ **1 tiến trình** `python -m edzbot run`; Rust inactive.
+
+### Batch 10 → 100 → tiếp tục (tự động, không dừng xin phép)
+| Mốc | posted (artifacts) | ready | jobs posted | catalog | Fault | Duplicate |
+|---|---:|---:|---:|---:|---|---|
+| Trước | 132948 | 6534 | 1 | 117123 | — | — |
+| Sau 10 | 132959 | 6523 | 12 | — | None | 0 |
+| Sau 100 | 133055 | 6427 | 108 | 117230 | None | 0 |
+| 03:31 UTC | **133118** | **6364** | **171** | **117293** | None | 0 |
+
+- Telegram ACK: mọi job posted đều có `target_message`; max target **133123**.
+- Duplicate spot-check trên kênh đích: mỗi tên **đúng 1** message.
+- FloodWait **0**, retry **0**, held job vẫn **1** (canary 1, không tự retry).
+- `/v2stats` (msg #3421): `Đã đăng: 163 (5.47 MiB), 31.83 file/phút`, ACK 0.4s.
+- Report đã gửi qua Control Bot (msg #3418).
+- Đĩa trống **143 GiB**.
+
+### Lỗi không chặn (đã ghi nhận)
+Reconciliation worker (legacy) vấp giới hạn `scan_limit=25000` vì lịch sử đích
+>133k message; nó **fail-closed**, không requeue held nào — đúng thiết kế. Cần
+tăng scan_limit hoặc bỏ worker này ở bản sau; không ảnh hưởng V2.
+
+Hệ thống tiếp tục chạy 24/7, tự tiêu thụ backlog còn lại với concurrency=1.
+
 ## 6. Giới hạn đã biết / rủi ro phải biết
 
 1. **`artifacts.sha256 PRIMARY KEY` vẫn còn** — V2 tách danh tính tên sang bảng phụ,
