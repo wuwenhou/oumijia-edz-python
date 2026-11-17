@@ -118,8 +118,10 @@ def test_config_publisher_mode_is_fail_closed(monkeypatch):
         Config.load(require_telegram=False)       # concurrency must be 1
     monkeypatch.setenv('UPLOAD_CONCURRENCY', '1')
     monkeypatch.setenv('PUBLISHER_MODE', 'normal')
+    assert Config.load(require_telegram=False).publisher_mode == 'normal'  # approved full rollout
+    monkeypatch.setenv('UPLOAD_ENGINE_V2', 'false')
     with pytest.raises(ValueError):
-        Config.load(require_telegram=False)       # normal must not enable V2
+        Config.load(require_telegram=False)       # normal must NOT fall back to V1
 
 
 def test_governor_never_recovers_in_canary():
@@ -207,6 +209,45 @@ def test_bad_local_sha_is_held_without_send(tmp_path):
 # ---------------------------------------------------------------------------
 # 4. /v2stats via control bot (no file post)
 # ---------------------------------------------------------------------------
+def test_ack_syncs_dedup_catalog(tmp_path):
+    db = DB(tmp_path / 'cat.sqlite3')
+    db.execute("CREATE TABLE edz_name_catalog(normalized_name TEXT PRIMARY KEY, "
+               "winner_sha256 TEXT NOT NULL, winner_artifact_sha TEXT NOT NULL, "
+               "winner_at REAL NOT NULL, state TEXT NOT NULL, updated_at REAL NOT NULL)")
+    p = tmp_path / 'c.edz'
+    p.write_bytes(b'c' * 10)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    e = eng(db)
+    e.enqueue('Catalog.edz', digest, str(p), 10)
+    j = dict(db.execute('SELECT * FROM upload_jobs').fetchone())
+    e.ack(j, 999)
+    row = db.execute("SELECT normalized_name,winner_sha256,state FROM edz_name_catalog "
+                     "WHERE normalized_name='catalog.edz'").fetchone()
+    assert row is not None and row['state'] == 'accepted' and row['winner_sha256'] == digest
+    db.close()
+
+
+def test_sqlite_fault_is_fail_closed_and_survives_restart(tmp_path):
+    path = tmp_path / 'fault.sqlite3'
+    db = DB(path)
+    p = tmp_path / 'f.edz'
+    p.write_bytes(b'f' * 10)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    e = eng(db, canary_name='F.EDZ', canary_mode=True)
+    e.enqueue('F.edz', digest, str(p), 10)
+    e.mark_fault(RuntimeError('database is locked'))
+    e.db.close()
+
+    # restart: a new engine must refuse to claim anything
+    e2 = eng(DB(path), canary_name='F.EDZ', canary_mode=True)
+    assert e2.faulted is True
+    assert asyncio.run(e2.publish_batch()) == 0
+    assert e2.db.execute("SELECT state FROM upload_jobs").fetchone()[0] == 'queued'
+    e2.clear_fault()
+    assert e2.faulted is False
+    e2.db.close()
+
+
 def test_v2stats_command_replies(monkeypatch):
     from edzbot.bot import Service
     s = object.__new__(Service)

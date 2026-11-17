@@ -174,8 +174,11 @@ class Config:
                 and cfg.upload_concurrency == 1 and cfg.upload_max_concurrency == 1):
             raise ValueError('Canary requires UPLOAD_ENGINE_V2=true, a canary name, '
                              'and UPLOAD_CONCURRENCY=UPLOAD_MAX_CONCURRENCY=1')
-        if cfg.publisher_mode == 'normal' and cfg.upload_engine_v2:
-            raise ValueError('PUBLISHER_MODE=normal must not enable V2 (full rollout not approved)')
+        # Full rollout runs V2 with V1 permanently retired. normal+V2=false would
+        # silently reactivate the legacy publisher, so forbid it (fail closed).
+        if cfg.publisher_mode == 'normal' and not cfg.upload_engine_v2:
+            raise ValueError('PUBLISHER_MODE=normal requires UPLOAD_ENGINE_V2=true '
+                             '(legacy V1 publisher must stay retired)')
         # Single private control group. The BotFather bot replies in that same room.
         if cfg.inbox_chat is not None:
             if not isinstance(cfg.inbox_chat, int) or cfg.inbox_chat >= 0:

@@ -18,7 +18,9 @@ from edzbot.upload_engine import (UploadEngine, EngineConfig, AdaptiveGovernor,
 
 def fresh_db(*, legacy: bool = False):
     db = DB(Path(':memory:'))
-    db.execute("CREATE TABLE IF NOT EXISTS edz_name_catalog(normalized_name TEXT, state TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS edz_name_catalog(normalized_name TEXT PRIMARY KEY, "
+               "winner_sha256 TEXT, winner_artifact_sha TEXT, winner_at REAL, "
+               "state TEXT, updated_at REAL)")
     if not legacy:   # production has this column; legacy Python DBs do not
         db.execute('ALTER TABLE artifacts ADD COLUMN normalized_name TEXT')
     return db

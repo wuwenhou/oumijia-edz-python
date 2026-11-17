@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import time
 
 from telethon import TelegramClient, events
@@ -977,7 +978,7 @@ class Service:
             a = self.db.next_artifact(allow_unverified=self.cfg.allow_unverified,
                                       require_complete_source=self.cfg.auto_mode)
             if (a and not self.cfg.dry_run and self.publisher_mode == 'normal'
-                    and self.upload_engine is None
+                    and not self.cfg.upload_engine_v2
                     and next_send_remaining(self.db) <= 0):
                 await self.publish_one(a)
                 continue
@@ -1064,6 +1065,10 @@ class Service:
             while True:
                 try:
                     await self.upload_engine.publish_batch()
+                except sqlite3.Error as ex:
+                    self.upload_engine.mark_fault(ex)
+                    log.error('SQLite fault: publisher locked until operator clears it')
+                    await asyncio.sleep(10)
                 except Exception:
                     log.exception('Upload Engine V2 batch failed; state preserved for recovery')
                     await asyncio.sleep(10)

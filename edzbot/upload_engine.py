@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
@@ -36,6 +37,7 @@ from .publish_guard import (flood_seconds_from_message, set_cooldown,
                             cooldown_remaining)
 
 log = logging.getLogger(__name__)
+FAULT_KEY = 'upload_engine_fault'      # persistent fail-closed publisher lock
 
 
 def source_media_reusable(original) -> bool:
@@ -166,6 +168,24 @@ class UploadEngine:
                                          allow_recovery=not self.cfg.canary_mode)
         self.canary_name = normalize_edz_name(self.cfg.canary_name) if self.cfg.canary_name else None
         self.stats = UploadStats(sysinfo=sysinfo)
+        # Fail closed across restarts: a previous SQLite fault keeps the
+        # publisher locked until an operator explicitly clears it.
+        try:
+            self.faulted = bool(self.db.value(FAULT_KEY, ''))
+        except Exception:
+            self.faulted = True
+
+    def mark_fault(self, exc) -> None:
+        self.faulted = True
+        try:
+            self.db.set(FAULT_KEY, str(exc)[:500])
+        except Exception:
+            log.exception('Could not persist upload-engine fault flag')
+        log.error('UPLOAD ENGINE FAULTED (publisher locked): %s', exc)
+
+    def clear_fault(self) -> None:
+        self.db.execute('DELETE FROM settings WHERE key=?', (FAULT_KEY,))
+        self.faulted = False
 
     # ---- durability / dedup ------------------------------------------------
     def _event(self, norm: str, kind: str, detail: str = '') -> None:
@@ -309,10 +329,16 @@ class UploadEngine:
                         "UPDATE artifacts SET state='posted', target_message=?, "
                         "error=NULL, updated_at=? WHERE sha256=?",
                         (int(target_message), now, job['sha256']))
+            # Keep the shared dedup index in sync: insert when the name is new,
+            # upgrade state when it already exists (same transaction as ACK).
             if self._table('edz_name_catalog'):
                 self.db.execute(
-                    "UPDATE edz_name_catalog SET state='accepted' WHERE normalized_name=?",
-                    (norm,))
+                    "INSERT INTO edz_name_catalog"
+                    "(normalized_name,winner_sha256,winner_artifact_sha,winner_at,state,updated_at)"
+                    " VALUES(?,?,?,?, 'accepted', ?)"
+                    " ON CONFLICT(normalized_name) DO UPDATE SET "
+                    "state='accepted', updated_at=excluded.updated_at",
+                    (norm, job['sha256'], job['sha256'], now, now))
             self._event(norm, 'ack', f'message={int(target_message)}')
             self.db.execute('COMMIT')
         except Exception:
@@ -416,25 +442,41 @@ class UploadEngine:
         await asyncio.sleep(seconds)
 
     # ---- loop --------------------------------------------------------------
+    async def _safe_publish(self, job: dict) -> bool:
+        try:
+            return await self.publish(job)
+        except sqlite3.Error as ex:
+            self.mark_fault(ex)
+            return False
+
     async def publish_batch(self) -> int:
         """One scheduler tick: claim up to `concurrency` jobs and publish them."""
-        if cooldown_remaining(self.db) > 0:
+        if self.faulted:
+            log.error('Upload Engine is faulted; no job will be claimed (fail-closed)')
             return 0
-        self.enqueue_ready_artifacts()
-        jobs = []
-        for _ in range(self.governor.current):
-            job = self.claim_next()
-            if job is None:
-                break
-            jobs.append(job)
-        if not jobs:
+        try:
+            if cooldown_remaining(self.db) > 0:
+                return 0
+            self.enqueue_ready_artifacts()
+            jobs = []
+            for _ in range(self.governor.current):
+                job = self.claim_next()
+                if job is None:
+                    break
+                jobs.append(job)
+            if not jobs:
+                return 0
+            results = await asyncio.gather(*(self._safe_publish(j) for j in jobs),
+                                           return_exceptions=True)
+            for job, res in zip(jobs, results):
+                if isinstance(res, BaseException):
+                    self.hold(job, f'Unexpected publisher failure: {res}')
+                    log.exception('V2 publisher batch error', exc_info=res)
+        except sqlite3.Error as ex:
+            # SQLite fault (lock/corruption/disk) must never leave a half-open
+            # queue: lock the publisher durably and let an operator reconcile.
+            self.mark_fault(ex)
             return 0
-        results = await asyncio.gather(*(self.publish(j) for j in jobs),
-                                       return_exceptions=True)
-        for job, res in zip(jobs, results):
-            if isinstance(res, BaseException):
-                self.hold(job, f'Unexpected publisher failure: {res}')
-                log.exception('V2 publisher batch error', exc_info=res)
         delay = float(self.get_delay() or 0.0)   # /limit override or SEND_DELAY; 0 = none
         if delay > 0:
             await asyncio.sleep(delay)
