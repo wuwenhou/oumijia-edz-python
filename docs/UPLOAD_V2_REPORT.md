@@ -272,6 +272,20 @@ tăng scan_limit hoặc bỏ worker này ở bản sau; không ảnh hưởng V2
 
 Hệ thống tiếp tục chạy 24/7, tự tiêu thụ backlog còn lại với concurrency=1.
 
+## 5e. TRUNG TÂM ĐIỀU KHIỂN (2026-11-17 04:00 UTC)
+
+Commit: `398047c` (sau `76d3b71`) · **150/150 test PASS**.
+
+- `/help` thay bằng đúng menu "🤖 OUMIJIA — TRUNG TÂM ĐIỀU KHIỂN" theo yêu cầu.
+- `/status` bổ sung khối `🚀 Upload V2: BẬT (concurrency 1/1)`, đã đăng/MiB·s/
+  file·phút, ACK TB, FloodWait, duplicate, hàng đợi, cờ FAULTED.
+- Sửa 2 lỗi phát hiện khi verify live: duplicate bị đếm lại mỗi tick (→ đếm 1 lần
+  cho mỗi tên) và thiếu xuống dòng trước dòng cooldown.
+- Deploy 2 file, restart có kiểm soát: PID **4051500**, NRestarts=0, V2 tiếp tục
+  đăng ngay (#134069). Backup `data/backups/20261117-control-center-menu/`.
+- Xác nhận trực tiếp qua Control Bot: `/help` msg #3448, `/status` msg #3447 —
+  `duplicate: 0`, xuống dòng đúng, V2 BẬT 1/1.
+
 ## 6. Giới hạn đã biết / rủi ro phải biết
 
 1. **`artifacts.sha256 PRIMARY KEY` vẫn còn** — V2 tách danh tính tên sang bảng phụ,
