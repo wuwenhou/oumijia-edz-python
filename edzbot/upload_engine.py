@@ -168,6 +168,7 @@ class UploadEngine:
                                          allow_recovery=not self.cfg.canary_mode)
         self.canary_name = normalize_edz_name(self.cfg.canary_name) if self.cfg.canary_name else None
         self.stats = UploadStats(sysinfo=sysinfo)
+        self._dup_counted: set[str] = set()   # count each prevented duplicate once
         # Fail closed across restarts: a previous SQLite fault keeps the
         # publisher locked until an operator explicitly clears it.
         try:
@@ -188,6 +189,12 @@ class UploadEngine:
         self.faulted = False
 
     # ---- durability / dedup ------------------------------------------------
+    def _count_duplicate(self, norm: str) -> None:
+        """Count each prevented duplicate name once, not once per scheduler tick."""
+        if norm not in self._dup_counted:
+            self._dup_counted.add(norm)
+            self.stats.duplicates += 1
+
     def _event(self, norm: str, kind: str, detail: str = '') -> None:
         self.db.execute(
             'INSERT INTO upload_events(at,normalized_name,kind,detail) VALUES(?,?,?,?)',
@@ -207,7 +214,7 @@ class UploadEngine:
             ' VALUES(?,?,?,?,?,?)',
             (norm, sha, name, int(size), source_message, time.time()))
         if cur.rowcount != 1:
-            self.stats.duplicates += 1
+            self._count_duplicate(norm)
             return False
         return True
 
@@ -228,7 +235,7 @@ class UploadEngine:
                     "SELECT 1 FROM edz_name_catalog WHERE normalized_name=? AND state='accepted'",
                     (norm,)).fetchone():
                 self.db.execute('ROLLBACK')
-                self.stats.duplicates += 1
+                self._count_duplicate(norm)
                 return False
             cur = self.db.execute(
                 'INSERT OR IGNORE INTO upload_name_owners'
@@ -237,7 +244,7 @@ class UploadEngine:
                 (norm, sha, name, int(size), source_message, now))
             if cur.rowcount != 1:
                 self.db.execute('ROLLBACK')
-                self.stats.duplicates += 1
+                self._count_duplicate(norm)
                 return False
             self.db.execute(
                 'INSERT OR IGNORE INTO upload_jobs'

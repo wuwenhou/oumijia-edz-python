@@ -176,7 +176,7 @@ class Service:
                 f'{s["mib_per_s"]} MiB/s · {s["files_per_min"]} file/phút\n'
                 f'   ACK TB: {s["avg_ack_s"]}s · FloodWait: {s["floodwaits"]} · '
                 f'duplicate: {s["duplicates"]}\n'
-                f'   Hàng đợi: {q}{fault}')
+                f'   Hàng đợi: {q}{fault}\n')
 
     async def handle_manual(self, msg):
         """Single room, authorized admin commands, no implicit download on upload."""

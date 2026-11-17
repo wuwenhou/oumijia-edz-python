@@ -105,6 +105,15 @@ def test_same_name_diff_sha_never_repost():
     assert e.stats.duplicates == 1
 
 
+def test_duplicate_counter_counts_each_name_once():
+    db = fresh_db()
+    e = make_engine(db)
+    e.enqueue('Dup.edz', 'a' * 64, '/tmp/d', 10)
+    for _ in range(50):
+        assert e.enqueue('DUP.edz', 'b' * 64, '/tmp/d2', 10) is False
+    assert e.stats.duplicates == 1
+
+
 def test_different_name_same_sha_independent():
     db = fresh_db()
     e = make_engine(db)
