@@ -162,6 +162,22 @@ class Service:
                 f'📤 Đang gửi: {s["posting"]}, EDZ chờ đăng: {s["ready"]}\n'
                 f'Giới hạn tải Telegram: {round(s["download_cooldown"])} giây\n')
 
+    def _v2_status_short(self) -> str:
+        if self.upload_engine is None:
+            return 'Upload V2: TẮT (đang dùng Publisher V1)\n'
+        s = self.upload_engine.stats.snapshot()
+        q = {r['state']: r['n'] for r in self.db.execute(
+            'SELECT state,COUNT(*) n FROM upload_jobs GROUP BY state').fetchall()}
+        fault = ('\n⚠️ Upload V2 FAULTED — publisher đã khóa, cần operator xử lý\n'
+                 if self.upload_engine.faulted else '')
+        return (f'🚀 Upload V2: BẬT (concurrency '
+                f'{self.upload_engine.governor.current}/{self.upload_engine.governor.maximum})\n'
+                f'   Đã đăng: {s["files"]} ({s["mib"]} MiB) · '
+                f'{s["mib_per_s"]} MiB/s · {s["files_per_min"]} file/phút\n'
+                f'   ACK TB: {s["avg_ack_s"]}s · FloodWait: {s["floodwaits"]} · '
+                f'duplicate: {s["duplicates"]}\n'
+                f'   Hàng đợi: {q}{fault}')
+
     async def handle_manual(self, msg):
         """Single room, authorized admin commands, no implicit download on upload."""
         if not message_allowed(msg, self.inbox_allowed):
@@ -239,34 +255,27 @@ class Service:
             verb, group_name, expected = command
             if verb in ('start','help'):
                 await self._manual_notice(
-                    '📚 OUMIJIA — BẢNG LỆNH ĐIỀU KHIỂN\n'
-                    'Gõ HELP, /help hoặc /start để xem hướng dẫn này.\n\n'
-                    '📥 NHẬN VÀ XỬ LÝ FILE\n'
-                    '/files — Xem file đã gửi nhưng chưa duyệt.\n'
-                    '/check — Đếm file .edz/.7z và các phần 7z đang chờ.\n'
-                    '/check Ten-goi.7z 3 — Kiểm tra bộ 3 phần .001/.002/.003 (chưa tải).\n'
-                    '/process — Cho phép tải và xử lý tất cả EDZ/7Z đơn lẻ đang chờ.\n'
-                    '/process Ten-goi.7z 3 — Cho phép tải và xử lý đủ 3 phần nén.\n'
-                    '/cancel — Hủy các lô thủ công chưa bắt đầu, không xóa file đã đăng.\n\n'
-                    '📊 THEO DÕI SERVER\n'
-                    '/status — Tổng EDZ đã đăng, chờ, lỗi, FloodWait.\n'
-                    '/server hoặc /health — Toàn cảnh CPU/RAM/SSD, uptime, dịch vụ EDZ.\n'
-                    '/cpu — CPU%, tải hệ thống, số luồng.\n'
-                    '/ram — RAM khả dụng và Swap.\n'
-                    '/disk — Dung lượng SSD đã dùng/còn trống, dự phòng 40 GiB.\n'
-                    '/uptime — Thời gian server hoạt động.\n'
-                    '/speed — Mức nghỉ hiện tại và nguồn cấu hình.\n'
-                    '/v2stats — Thống kê Upload Engine V2 (nếu bật).\n'
-                    '/stream7z <đường dẫn trong DATA_DIR> — Stream 7z qua V2.\n'
-                    '/limit N — Khoảng nghỉ giữa 2 EDZ (giây); 0 = không giới hạn.\n'
-                    '/limit reset — Bỏ ghi đè, quay về SEND_DELAY_SECONDS (mặc định 3).\n'
-                    '/errors — Tổng hợp các loại lỗi đang held.\n'
-                    '/errorscsv — Xuất CSV toàn bộ lỗi qua Telegram.\n'
-                    '/errorsfiles — CSV các file lỗi còn trên ổ.\n'
-                    '/errors 158 — Chi tiết nguồn #158.\n\n'
-                    '🔒 Chỉ quản trị viên được cấp quyền có thể ra lệnh. '
-                    'Gửi file chỉ ghi metadata, KHÔNG tải/đăng trước /process. '
-                    'Lỗi server được watchdog kiểm tra 2 phút/lần (sau khi bật timer).')
+                    '🤖 OUMIJIA — TRUNG TÂM ĐIỀU KHIỂN\n\n'
+                    '📦 QUẢN LÝ EDZ\n\n'
+                    '- "/files" — Xem file đang chờ duyệt.\n'
+                    '- "/process" — Duyệt tải và xử lý file.\n'
+                    '- "/cancel" — Hủy các file chưa bắt đầu.\n\n'
+                    '📊 HỆ THỐNG\n\n'
+                    '- "/status" — Trạng thái EDZ, Upload V2 và tốc độ đăng.\n'
+                    '- "/health" — CPU, RAM, SSD và dịch vụ.\n'
+                    '- "/errors" — Xem lỗi cần xử lý.\n\n'
+                    '⚙️ CÀI ĐẶT\n\n'
+                    '- "/limit" — Xem hoặc chỉnh khoảng nghỉ upload.\n'
+                    '- "/help" — Xem hướng dẫn.\n\n'
+                    'Lệnh mở rộng:\n\n'
+                    '- "/files ABC.7z 3" — Kiểm tra đủ 3 phần nén.\n'
+                    '- "/process ABC.7z 3" — Duyệt xử lý bộ nén.\n'
+                    '- "/errors 158" — Xem chi tiết lỗi.\n'
+                    '- "/errors csv" — Xuất báo cáo lỗi.\n'
+                    '- "/limit 3" — Nghỉ 3 giây giữa các lượt đăng.\n'
+                    '- "/limit reset" — Khôi phục mức nghỉ mặc định.\n\n'
+                    '🔒 Chỉ quản trị viên được phép điều khiển. '
+                    'File gửi vào nhóm chỉ được ghi nhận; cần "/process" để duyệt tải và xử lý.')
                 return
             if verb == 'files':
                 rows = staged_rows(self.db)
@@ -334,6 +343,7 @@ class Service:
                     f'Khoảng nghỉ hiện tại: {current_delay(self.db, self.cfg):g} giây '
                     f'(nguồn: {delay_source}; 0 = không giới hạn)\n'
                     + self._pipeline_status_short_v163()
+                    + self._v2_status_short()
                     + f'Telegram yêu cầu chờ thêm: {round(cooldown_remaining(self.db))} giây')
                 return
             if verb in ('server', 'health', 'cpu', 'ram', 'disk', 'uptime'):

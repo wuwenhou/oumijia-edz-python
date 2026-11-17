@@ -248,6 +248,42 @@ def test_sqlite_fault_is_fail_closed_and_survives_restart(tmp_path):
     e2.db.close()
 
 
+def test_help_menu_is_new_control_center(monkeypatch):
+    from edzbot.bot import Service
+    s = object.__new__(Service)
+    s.cfg = SimpleNamespace(publisher_mode='normal', upload_engine_v2=True)
+    s.db = DB(Path(':memory:'))
+    s.upload_engine = None
+    s.inbox_allowed = frozenset()
+    out = []
+    async def notice(t):
+        out.append(t)
+    s._manual_notice = notice
+    monkeypatch.setattr('edzbot.bot.message_allowed', lambda m, a: True)
+    asyncio.run(s.handle_manual(type('M', (), {'raw_text': '/help'})()))
+    assert out and 'TRUNG TÂM ĐIỀU KHIỂN' in out[0]
+    assert '/status' in out[0] and 'Upload V2' in out[0]
+    assert 'BẢNG LỆNH' not in out[0]
+    s.db.close()
+
+
+def test_v2_status_block():
+    from edzbot.bot import Service
+    from edzbot.upload_engine import UploadStats
+    s = object.__new__(Service)
+    s.db = DB(Path(':memory:'))
+    s.upload_engine = SimpleNamespace(
+        stats=UploadStats(),
+        governor=SimpleNamespace(current=1, maximum=1),
+        faulted=False)
+    s.upload_engine.stats.record_upload(1024**2, 0.4)
+    text = s._v2_status_short()
+    assert 'Upload V2: BẬT' in text and 'file/phút' in text and 'FloodWait' in text
+    s.upload_engine.faulted = True
+    assert 'FAULTED' in s._v2_status_short()
+    s.db.close()
+
+
 def test_v2stats_command_replies(monkeypatch):
     from edzbot.bot import Service
     s = object.__new__(Service)
