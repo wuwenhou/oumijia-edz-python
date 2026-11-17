@@ -129,10 +129,15 @@ def next_alert(db) -> tuple[str, str] | None:
                                  FROM upload_jobs WHERE state='held' ORDER BY created_at LIMIT 10000"""):
             reason = row['error'] or 'Unknown upload job error'
             key = 'v2job:' + row['normalized_name'] + ':' + hashlib.sha256(reason.encode()).hexdigest()
-            events.append((key, f'⚠️ OUMIJIA — LỖI UPLOAD V2 CẦN ĐỐI SOÁT\n'
+            low = reason.casefold()
+            waiting = ('floodwait' in low or 'reconciliation' in low or 'a wait of' in low)
+            state_line = ('Đang chờ đối soát kênh đích; KHÔNG tự retry, KHÔNG tự giải phóng job.'
+                          if waiting else
+                          'CẦN QUẢN TRỊ VIÊN xử lý; job bị giữ, KHÔNG tự retry.')
+            events.append((key, f'⚠️ OUMIJIA — LỖI UPLOAD V2\n'
                                 f'File: {row["file_name"]}\nNguồn: #{row["source_message"]}\n'
                                 f'SHA256: {row["sha256"]}\nNguyên nhân: {vi_reason(reason)}\n'
-                                'Trạng thái: job held; KHÔNG tự retry, cần đối soát kênh đích.'))
+                                f'Trạng thái: {state_line}'))
     for row in db.execute('SELECT issue_key,text FROM auto_issues ORDER BY created_at LIMIT 10000'):
         events.append(('internal:' + row['issue_key'],
                        '⚠️ OUMIJIA — LỖI HỆ THỐNG\n' + vi_reason(row['text']) + '\nThông tin kỹ thuật: ' + row['text'][:250]))

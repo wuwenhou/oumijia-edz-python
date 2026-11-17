@@ -6,13 +6,21 @@ only examines artifacts HELD for FloodWait; serious errors remain untouched.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 import re
 import time
 
+from .name_guard import normalize_edz_name
+
 log = logging.getLogger(__name__)
 _SHA_RE = re.compile(r'(?m)^SHA-256:\s*([0-9a-fA-F]{64})\s*$')
+_FILE_RE = re.compile(r'(?m)^File:\s*(.+?)\s*$')
+RECON_CURSOR = 'dest_reconcile_cursor'
+RECON_FOUND = 'dest_reconcile_found'
+RECON_DONE = 'dest_reconcile_done'
+RECON_WATERMARK = 'dest_reconcile_watermark'
 
 
 def flood_seconds_from_message(message: str) -> int | None:
@@ -31,6 +39,38 @@ def flood_error(error: str | None) -> bool:
 def held_flood_rows(db):
     return [r for r in db.execute("SELECT * FROM artifacts WHERE state='held' AND target_message IS NULL")
             if flood_error(r['error'])]
+
+
+def parse_destination_caption(text: str) -> tuple[str | None, str | None]:
+    """Return (normalized file name, lowercase SHA-256) from an OUMIJIA caption."""
+    name = _FILE_RE.search(text or '')
+    sha = _SHA_RE.search(text or '')
+    return (normalize_edz_name(name.group(1)) if name else None,
+            sha.group(1).lower() if sha else None)
+
+
+def reconcilable_rows(db) -> list[dict]:
+    """Held rows from BOTH the legacy publisher and Upload Engine V2."""
+    rows: list[dict] = []
+    for r in held_flood_rows(db):
+        rows.append({'source': 'artifact', 'key': r['sha256'], 'sha': r['sha256'].lower(),
+                     'norm_name': normalize_edz_name(r['file_name']),
+                     'size': int(r['size_bytes'])})
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='upload_jobs'").fetchone():
+        for r in db.execute("""SELECT normalized_name,sha256,file_name,size_bytes,error
+                               FROM upload_jobs WHERE state='held' AND target_message IS NULL"""):
+            err = (r['error'] or '').lower()
+            if not (flood_error(err) or 'reconciliation' in err or 'ambiguous' in err):
+                continue
+            rows.append({'source': 'v2_job', 'key': r['normalized_name'],
+                         'sha': r['sha256'].lower(),
+                         'norm_name': normalize_edz_name(r['file_name']),
+                         'size': int(r['size_bytes'])})
+    return rows
+
+
+def has_held_reconcilable(db) -> bool:
+    return bool(reconcilable_rows(db))
 
 
 def cooldown_remaining(db, *, now: float | None = None) -> float:
@@ -66,56 +106,154 @@ def schedule_next_send(db, seconds: float):
     db.set('publisher_next_send_at', str(time.time() + max(0.0, seconds)))
 
 
-async def reconcile_flood_held(db, client, target, *, scan_limit: int = 25000):
-    """Read the *entire* destination history before requeuing FloodWait holds.
+def _load_checkpoint(db) -> tuple[int, dict, int]:
+    try:
+        cursor = int(db.value(RECON_CURSOR, '0') or 0)
+    except (TypeError, ValueError):
+        cursor = 0
+    try:
+        found = {tuple(x[0]): int(x[1]) for x in json.loads(db.value(RECON_FOUND, '[]') or '[]')}
+    except (TypeError, ValueError):
+        found = {}
+    try:
+        watermark = int(db.value(RECON_WATERMARK, '0') or 0)
+    except (TypeError, ValueError):
+        watermark = 0
+    return cursor, found, watermark
 
-    If Telegram fails, or scan_limit would truncate the history, leave ALL
-    pending holds untouched. A found matching caption is marked posted. An
-    absent SHA is released only when its local verified-source output exists;
-    SHA content is verified again by publish_one immediately before send.
+
+def _save_checkpoint(db, cursor: int, found: dict) -> None:
+    db.set(RECON_CURSOR, str(cursor))
+    db.set(RECON_FOUND, json.dumps([[list(k), v] for k, v in found.items()]))
+
+
+def _clear_checkpoint(db) -> None:
+    db.execute('DELETE FROM settings WHERE key IN (?,?,?)',
+               (RECON_CURSOR, RECON_FOUND, RECON_DONE))
+
+
+async def reconcile_held(db, client, target, *, page_size: int = 1000,
+                         max_pages: int | None = None) -> dict:
+    """Resumable, fail-closed destination reconciliation for V1 + V2.
+
+    Scans the destination in pages, persisting an offset cursor and the matches
+    already seen after EVERY page. Only when the scan reaches the end (or the
+    stored watermark) are matches applied -- in one place, per held row only.
+    An interrupted/flooded scan applies NOTHING and can be resumed safely.
+    Absent evidence never releases a held job (no 'probably not posted').
     """
-    rows = held_flood_rows(db)
+    rows = reconcilable_rows(db)
     if not rows:
-        return {'scanned': 0, 'posted': 0, 'ready': 0, 'left_held': 0}
+        return {'complete': True, 'scanned': 0, 'posted_artifact': 0,
+                'posted_v2': 0, 'left_held': 0, 'pages': 0}
 
-    known = {r['sha256'].lower(): r for r in rows}
-    found: dict[str, int] = {}
-    scanned = 0
-    async for msg in client.iter_messages(target):
-        scanned += 1
-        if scanned > scan_limit:
-            raise RuntimeError(f'Destination history exceeds safe scan limit of {scan_limit}; no recovery performed')
-        if not getattr(msg, 'document', None):
-            continue
-        match = _SHA_RE.search(getattr(msg, 'message', '') or '')
-        if not match:
-            continue
-        sha = match.group(1).lower()
-        if sha not in known:
-            continue
-        size = getattr(getattr(msg, 'document', None), 'size', None)
-        if size is not None and int(size) != int(known[sha]['size_bytes']):
-            log.warning('SHA caption matches but target size differs: %s', sha)
-            continue
-        if sha in found and found[sha] != msg.id:
-            raise RuntimeError(f'Duplicate SHA found in destination history: {sha}; no recovery performed')
-        found[sha] = int(msg.id)
+    targets: dict[tuple[str, str, int], list[dict]] = {}
+    for r in rows:
+        targets.setdefault((r['sha'], r['norm_name'], r['size']), []).append(r)
 
-    posted = ready = 0
-    for sha, row in known.items():
-        latest = db.execute('SELECT state,error FROM artifacts WHERE sha256=?', (sha,)).fetchone()
-        if not latest or latest['state'] != 'held' or not flood_error(latest['error']):
-            continue
-        if sha in found:
-            db.update_artifact(sha, 'posted', target_message=found[sha], error=None)
-            posted += 1
-            continue
-        file = Path(row['path'])
-        source = db.execute('SELECT state FROM messages WHERE id=?', (row['source_message'],)).fetchone()
-        if (source and source['state'] == 'complete' and file.is_file()
-                and file.stat().st_size == row['size_bytes']):
-            # publish_one will verify SHA against file bytes again before send.
-            db.update_artifact(sha, 'ready', error=None)
-            ready += 1
-    return {'scanned': scanned, 'posted': posted, 'ready': ready,
-            'left_held': len(known) - posted - ready}
+    cursor, found, watermark = _load_checkpoint(db)
+    scanned = pages = highest = 0
+    complete = False
+    try:
+        while True:
+            page = []
+            async for msg in client.iter_messages(target, offset_id=cursor or None,
+                                                  limit=page_size):
+                page.append(msg)
+            if not page:
+                complete = True
+                break
+            for msg in page:
+                scanned += 1
+                mid = int(msg.id)
+                highest = max(highest, mid)
+                if watermark and mid <= watermark:
+                    complete = True
+                    break
+                if not getattr(msg, 'document', None):
+                    continue
+                norm, sha = parse_destination_caption(getattr(msg, 'message', '') or '')
+                if not norm or not sha:
+                    continue
+                try:
+                    size = int(getattr(msg.document, 'size', 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                for t in targets.get((sha, norm, size), []):
+                    key = (t['source'], t['key'])
+                    prev = found.get(key)
+                    if prev is not None and prev != mid:
+                        raise RuntimeError(
+                            f'Conflicting Telegram message ids for {t["source"]}:{t["key"]}; '
+                            'no recovery performed')
+                    found[key] = mid
+            if complete:
+                break
+            oldest = min(int(m.id) for m in page)
+            # No backward progress would spin forever on a broken client.
+            if cursor and oldest >= cursor:
+                raise RuntimeError('Destination pagination made no progress; no recovery performed')
+            cursor = oldest
+            _save_checkpoint(db, cursor, found)
+            pages += 1
+            if max_pages is not None and pages >= max_pages:
+                return {'complete': False, 'scanned': scanned, 'pages': pages,
+                        'posted_artifact': 0, 'posted_v2': 0, 'left_held': len(rows),
+                        'paused': True}
+    except Exception:
+        # Keep whatever was learned so a later run resumes from this page.
+        _save_checkpoint(db, cursor, found)
+        raise
+
+    if not complete:
+        _save_checkpoint(db, cursor, found)
+        return {'complete': False, 'scanned': scanned, 'pages': pages,
+                'posted_artifact': 0, 'posted_v2': 0, 'left_held': len(rows)}
+
+    posted_artifact = posted_v2 = 0
+    for (source, key), mid in found.items():
+        if source == 'artifact':
+            row = db.execute("SELECT state FROM artifacts WHERE sha256=?", (key,)).fetchone()
+            if row and row['state'] == 'held':
+                db.update_artifact(key, 'posted', target_message=mid, error=None)
+                posted_artifact += 1
+        else:
+            row = db.execute("SELECT state FROM upload_jobs WHERE normalized_name=?", (key,)).fetchone()
+            if row and row['state'] == 'held':
+                now = time.time()
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute("UPDATE upload_jobs SET state='posted',target_message=?,error=NULL,"
+                               "updated_at=? WHERE normalized_name=? AND state='held'",
+                               (mid, now, key))
+                    job_sha = db.execute(
+                        "SELECT sha256 FROM upload_jobs WHERE normalized_name=?",
+                        (key,)).fetchone()[0]
+                    if db.execute("SELECT 1 FROM pragma_table_info('artifacts') "
+                                  "WHERE name='normalized_name'").fetchone():
+                        db.execute("UPDATE artifacts SET state='posted',target_message=?,"
+                                   "error=NULL,normalized_name=?,updated_at=? "
+                                   "WHERE sha256=? AND state='held'",
+                                   (mid, key, now, job_sha))
+                    else:
+                        db.execute("UPDATE artifacts SET state='posted',target_message=?,"
+                                   "error=NULL,updated_at=? WHERE sha256=? AND state='held'",
+                                   (mid, now, job_sha))
+                    db.execute("INSERT INTO upload_events(at,normalized_name,kind,detail)"
+                               " VALUES(?,?,?,?)", (now, key, 'reconciled_ack', f'message={mid}'))
+                    db.execute('COMMIT')
+                except Exception:
+                    db.execute('ROLLBACK')
+                    raise
+                posted_v2 += 1
+
+    _clear_checkpoint(db)
+    db.set(RECON_WATERMARK, str(highest or watermark))
+    return {'complete': True, 'scanned': scanned, 'pages': pages,
+            'posted_artifact': posted_artifact, 'posted_v2': posted_v2,
+            'left_held': len(rows) - posted_artifact - posted_v2}
+
+
+async def reconcile_flood_held(db, client, target, *, scan_limit: int = 25000):
+    """Backwards-compatible entry point; now paginated and resumable."""
+    return await reconcile_held(db, client, target, page_size=min(1000, max(1, scan_limit)))

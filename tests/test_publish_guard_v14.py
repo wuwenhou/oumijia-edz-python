@@ -1,4 +1,9 @@
-"""No Telegram connection: deterministic FloodWait recovery and idempotency tests."""
+"""No Telegram connection: deterministic FloodWait reconciliation and idempotency.
+
+Contract after the resumable-reconciliation upgrade: a full scan CONFIRMS posted
+only with caption+name+size+message-id evidence; absence never releases a held
+job, so no 'ready' state is inferred from an incomplete/empty scan.
+"""
 import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,16 +27,18 @@ class FakeClient:
         self.msgs = list(msgs or [])
         self.fail = fail
 
-    async def iter_messages(self, target):
+    async def iter_messages(self, target, offset_id=None, limit=None):
         for m in self.msgs:
+            if offset_id is not None and int(m.id) >= int(offset_id):
+                continue
             yield m
         if self.fail:
             raise RuntimeError('API disconnected')
 
 
-def message(sha, n, size, *, media=True):
+def message(sha, n, size, *, media=True, name='x.edz'):
     return SimpleNamespace(id=n, document=SimpleNamespace(size=size) if media else None,
-                           message=f'EPLAN EDZ\nSHA-256: {sha}\n#EDZ')
+                           message=f'EPLAN EDZ\nFile: {name}\nSHA-256: {sha}\n#EDZ')
 
 
 class GuardTests(unittest.TestCase):
@@ -75,15 +82,15 @@ class GuardTests(unittest.TestCase):
     def test_history_match_marks_posted(self):
         sha = self.artifact(b'a')
         out = asyncio.run(reconcile_flood_held(self.db, FakeClient([message(sha, 2001, 1)]), -1))
-        self.assertEqual((out['posted'], out['ready']), (1, 0))
+        self.assertEqual((out['posted_artifact'], out['left_held']), (1, 0))
         self.assertEqual(self.row(sha)['target_message'], 2001)
         self.assertEqual(self.row(sha)['state'], 'posted')
 
-    def test_no_match_releases_verified_source(self):
+    def test_no_match_never_releases_held(self):
         sha = self.artifact(b'b')
         out = asyncio.run(reconcile_flood_held(self.db, FakeClient([]), -1))
-        self.assertEqual(out['ready'], 1)
-        self.assertEqual(self.row(sha)['state'], 'ready')
+        self.assertEqual(out['left_held'], 1)
+        self.assertEqual(self.row(sha)['state'], 'held')
         self.assertEqual(self.row(sha)['target_message'], None)
 
     def test_serious_held_untouched(self):
@@ -114,8 +121,8 @@ class GuardTests(unittest.TestCase):
     def test_wrong_size_not_match(self):
         sha = self.artifact(b'g')
         out = asyncio.run(reconcile_flood_held(self.db, FakeClient([message(sha, 1, 9999)]), -1))
-        self.assertEqual(out['posted'], 0)
-        self.assertEqual(self.row(sha)['state'], 'ready')
+        self.assertEqual(out['posted_artifact'], 0)
+        self.assertEqual(self.row(sha)['state'], 'held')
 
     def test_missing_local_remains_held(self):
         sha = self.artifact(b'h')
@@ -134,8 +141,8 @@ class GuardTests(unittest.TestCase):
         sha = self.artifact(b'j')
         asyncio.run(reconcile_flood_held(self.db, FakeClient([]), -1))
         out = asyncio.run(reconcile_flood_held(self.db, FakeClient([]), -1))
-        self.assertEqual(out['ready'], 0)
-        self.assertEqual(self.row(sha)['state'], 'ready')
+        self.assertEqual(out['left_held'], 1)
+        self.assertEqual(self.row(sha)['state'], 'held')
 
 
 if __name__ == '__main__':

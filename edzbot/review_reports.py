@@ -19,7 +19,18 @@ import uuid
 
 REPORT_RE = re.compile(r'^/errors(?:(csv|files))?(?:@[A-Za-z0-9_]+)?(?:\s+(.+))?$', re.I)
 COLUMNS = ('type', 'source_id', 'artifact_sha256', 'file_name', 'category',
-           'file_exists', 'file_path', 'repair_caption', 'error', 'recommendation')
+           'disposition', 'file_exists', 'file_path', 'repair_caption',
+           'error', 'recommendation')
+NO_AUTO_FIX = '(chưa có lệnh sửa tự động)'
+
+
+def disposition(error: str) -> str:
+    """Distinguish 'waiting for destination reconciliation' from 'needs admin'."""
+    e = (error or '').casefold()
+    if ('floodwait' in e or 'reconciliation' in e or 'a wait of' in e
+            or 'đang chờ đối soát' in e):
+        return 'AWAITING_RECONCILIATION'
+    return 'NEEDS_ADMIN'
 REMEDIES = {
     'MULTI_PART': 'Kiểm tra adapter edzsplit-rs; không tự requeue hàng loạt.',
     'INCOMPLETE_EDZ': 'Kiểm tra macro/tài nguyên thiếu; giữ held đến khi hợp lệ.',
@@ -123,8 +134,16 @@ def query_held(root: Path, *, existing_only=False) -> list[dict]:
             ('v2_job', "SELECT source_message AS source_id, sha256, file_name, path, error "
                        "FROM upload_jobs WHERE state='held' ORDER BY created_at"),
         )
+        seen: set[tuple[str, str]] = set()
         for kind, sql in queries:
             for rec in db.execute(sql):
+                # Same physical failure can exist in both artifacts and the V2
+                # queue. Keep both *types* visible but never duplicate a row
+                # inside one type (uncontrolled double counting in CSV).
+                ident = (kind, str(rec['sha256'] or rec['source_id'] or rec['file_name']))
+                if ident in seen:
+                    continue
+                seen.add(ident)
                 rel, exists = controlled_path(root, rec['path'] or '')
                 if existing_only and not exists:
                     continue
@@ -132,7 +151,7 @@ def query_held(root: Path, *, existing_only=False) -> list[dict]:
                 error = rec['error'] or ''
                 category = classify(error)
                 caption = (f'FIX_SOURCE:{rec["source_id"]}' if kind == 'source'
-                           else f'FIX_V2JOB:{rec["file_name"]}' if kind == 'v2_job'
+                           else NO_AUTO_FIX if kind == 'v2_job'
                            else f'FIX_ARTIFACT:{sha}')
                 result.append({
                     'type': kind,
@@ -140,6 +159,7 @@ def query_held(root: Path, *, existing_only=False) -> list[dict]:
                     'artifact_sha256': sha,
                     'file_name': rec['file_name'] or '',
                     'category': category,
+                    'disposition': disposition(error),
                     'file_exists': 'yes' if exists else 'no',
                     'file_path': rel,
                     'repair_caption': caption,
@@ -168,24 +188,38 @@ def csv_bytes(rows: list[dict]) -> bytes:
 def summary_text(rows: list[dict]) -> str:
     kinds = Counter(r['type'] for r in rows)
     cats = Counter(r['category'] for r in rows)
+    disp = Counter(r.get('disposition') or disposition(r.get('error', '')) for r in rows)
     body = '\n'.join(f'• {name}: {num}' for name, num in cats.most_common(12))
-    return (f'📋 OUMIJIA — Nguồn Held: {kinds["source"]}; Artifact Held: {kinds["artifact"]}\n'
+    return (f'📋 OUMIJIA — Nguồn Held: {kinds["source"]}; '
+            f'Artifact Held: {kinds["artifact"]}; V2 Job Held: {kinds["v2_job"]}\n'
+            f'• Cần quản trị viên xử lý: {disp["NEEDS_ADMIN"]}; '
+            f'đang chờ đối soát: {disp["AWAITING_RECONCILIATION"]}\n'
             + (body or 'Chưa có lỗi.')
-            + '\n/errorscsv — CSV đầy đủ; /errorsfiles — CSV file còn trên ổ; /errors 158 — chi tiết nguồn.')
+            + '\n/errors csv — CSV đầy đủ; /errors files — CSV file còn trên ổ; '
+              '/errors 158 — chi tiết nguồn; /errors <SHA256> — tra cứu theo hash.')
 
 
 def detail_text(rows: list[dict], kind: str, key: str) -> str:
-    for r in rows:
-        if (kind == 'source' and r['type'] == 'source' and str(r['source_id']) == key) or (
-                kind == 'artifact' and r['type'] == 'artifact' and r['artifact_sha256'] == key):
+    for r in sorted(rows, key=lambda x: 0 if x['type'] == 'v2_job' else 1):
+        match = ((kind == 'source' and r['type'] == 'source' and str(r['source_id']) == key)
+                 or (kind == 'artifact' and r['artifact_sha256'] == key
+                     and r['type'] in ('artifact', 'v2_job')))
+        if match:
+            disp = r.get('disposition') or disposition(r.get('error', ''))
+            state = ('ĐANG CHỜ ĐỐI SOÁT Telegram; KHÔNG tự retry'
+                     if disp == 'AWAITING_RECONCILIATION'
+                     else 'CẦN QUẢN TRỊ VIÊN xử lý thủ công')
+            caption = r.get('repair_caption') or ''
+            fix_line = ('' if caption in ('', NO_AUTO_FIX)
+                        else '\nCaption sửa: ' + caption)
             return ('🔎 OUMIJIA — ' + r['type'].upper() + ' ' + key + '\n'
                     + 'File: ' + str(r['file_name'])[:140] + '\n'
                     + 'Nhóm: ' + r['category'] + '\n'
+                    + 'Trạng thái: ' + state + '\n'
                     + 'Còn trên ổ: ' + r['file_exists'] + '\n'
                     + 'Đường dẫn: ' + r['file_path'][:350] + '\n'
                     + 'Lỗi: ' + re.sub(r'[\r\n]+', ' ', r['error'])[:850] + '\n'
-                    + 'Đề xuất: ' + r['recommendation'] + '\n'
-                    + 'Caption sửa: ' + r['repair_caption'])
+                    + 'Đề xuất: ' + r['recommendation'] + fix_line)
     return 'Không tìm thấy bản ghi held tương ứng. Có thể file đã được xử lý.'
 
 

@@ -49,7 +49,7 @@ def test_v2_held_job_appears_in_errors_and_csv(tmp_path):
     v2 = [r for r in rows if r['type'] == 'v2_job']
     assert len(v2) == 1
     assert v2[0]['file_name'] == 'HELD.edz'
-    assert v2[0]['repair_caption'].startswith('FIX_V2JOB:')
+    assert v2[0]['repair_caption'] == '(chưa có lệnh sửa tự động)'
     data = csv_bytes(rows)
     assert b'HELD.edz' in data and b'v2_job' in data
     db.close()

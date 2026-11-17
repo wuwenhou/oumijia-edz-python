@@ -127,12 +127,74 @@ Môi trường: SQLite file-backed riêng + Telegram client giả lập, không 
 7. Dọn dẹp log reconciliation lặp 30 phút/lần (giảm noise journal).
 8. Rà soát 306 artifact held lịch sử để phân loại lại sau khi có reconciliation mới.
 
-## 7. Kết luận
+## 8. Đợt hoàn thiện tiếp theo (staging, commit mới)
 
-**PARTIAL — Hoạt động nhưng còn thiếu chức năng.**
+### 8.1 Lỗi đã sửa
 
-Không có bằng chứng mất dữ liệu hay đăng trùng; cơ chế fail-closed, ACK transaction,
-fault lock và name-dedup hoạt động đúng. Tuy nhiên: (a) reconciliation bị giới hạn 25k
-trong khi lịch sử >134k → held FloodWait không hồi phục được; (b) production hiện chưa
-báo/catalog hóa job held V2 (đã sửa trên staging, chưa deploy); (c) watchdog timer inactive.
-Các điểm HIGH cần xử lý trước khi có thể nói "an toàn và đầy đủ".
+| Vấn đề | Cách sửa |
+|---|---|
+| V2 held vô hình trong `/errors` | `query_held()` lấy thêm `upload_jobs`; summary có riêng **V2 Job Held**; `/errors <SHA256>` tra được cả V2 (ưu tiên V2 nếu trùng SHA) |
+| CSV thiếu/không rõ nguồn V2 | CSV có cột `disposition` (`NEEDS_ADMIN` / `AWAITING_RECONCILIATION`), dedup theo `(type, key)`, **không còn `FIX_V2JOB`** (thay bằng `(chưa có lệnh sửa tự động)`) |
+| Thông báo không phân biệt | Alert V2 ghi rõ "CẦN QUẢN TRỊ VIÊN" hoặc "ĐANG CHỜ ĐỐI SOÁT"; `/errors` chi tiết có dòng `Trạng thái:` tương ứng |
+| Reconciliation kẹt ở 25k | Thay bằng `reconcile_held()`: phân trang `page_size`, cursor + found + watermark lưu trong `settings`, tiếp tục được sau gián đoạn; hỗ trợ lịch sử **150.000+** message |
+| Chỉ đối soát V1 | Đối soát cả `artifacts` V1 và `upload_jobs` V2, khớp **tên chuẩn hóa + SHA256 + size + Message ID** |
+| Suy luận "chưa đăng" từ quét chưa xong | **Bỏ hoàn toàn** hành động chuyển held→ready; chỉ đánh dấu posted khi có bằng chứng Telegram. Không retry ambiguous/protected, không đụng job không liên quan |
+| FloodWait/mất mạng giữa trang | Lưu checkpoint rồi re-raise; bot áp cooldown; lần sau resume từ cursor. Không áp dụng kết quả nếu chưa quét xong |
+
+`reconcile_flood_held()` được giữ làm wrapper tương thích; bot giờ kiểm tra
+`has_held_reconcilable()` (cả V1 + V2) trước khi chạy.
+
+### 8.2 Watchdog — nguyên nhân timer inactive
+
+- Unit/timer tồn tại đúng: `OnCalendar=*-*-* *:0/2:00`, `Persistent=true`,
+  `ExecStart=.../scripts/edz-server-watchdog-v16.py`, `ReadWritePaths=.../data`.
+- `systemctl is-enabled edz-server-watchdog.timer` → **disabled**; timer chưa bao giờ
+  được `enable --now`. Bot token/ERROR_CHAT đã cấu hình. Có timer Rust riêng đang chạy
+  (`oumijia-rs-watchdog.timer`) nhưng không phủ service Python.
+- **Không bật timer production** khi chưa phê duyệt. Đã test state machine bằng mock:
+  phát hiện issue mới, thông báo phục hồi, phát hiện gap giám sát và restart count.
+
+### 8.3 Kiểm thử
+
+**177 PASS / 0 FAIL** trên clone (full suite), compile OK. Bổ sung:
+
+- Lịch sử giả lập **150.000 message**, phân trang 1.000 → checkpoint → resume → posted đúng
+  message #137500 cho cả artifact V1 và job V2, `left_held=0`.
+- Mất mạng giữa trang → checkpoint được lưu, **không đổi trạng thái**, resume thành công.
+- ACK thất lạc (V2 ambiguous) → đối soát thành `posted` + event `reconciled_ack`,
+  **không hề gọi publish**.
+- Cùng tên/SHA khác, sai size → **không khớp**, job vẫn `held`.
+- Job không liên quan (PROTECTED) giữ nguyên.
+- `/errors`: V2 held trong summary/CSV, tra cứu theo SHA, không có `FIX_V2JOB`.
+- Watchdog mock: issue/recovery/gap/restart.
+
+### 8.4 Còn tồn tại / chưa deploy
+
+- **Production vẫn chạy code cũ** (`e4f0c52` cho Control Bot); đợt sửa này **chưa deploy**,
+  chưa restart, chưa đổi DB/pacing/concurrency, không đăng file thử.
+- Watchdog timer vẫn inactive (chờ phê duyệt bật).
+- `auto_issues` vẫn không có cờ resolved (Medium).
+- 306 artifact held lịch sử cần rà soát thủ công sau khi reconciliation mới chạy.
+
+### 8.5 Hướng dẫn triển khai an toàn (chờ phê duyệt)
+
+1. Backup SQLite (Backup API) + source + `.env` + systemd unit.
+2. Deploy 4 file: `publish_guard.py`, `bot.py`, `review_reports.py`, `auto_alerts.py`
+   (sha256 phải khớp commit mới). Không đụng `upload_engine.py`, `config.py`, `.env`.
+3. Chạy `py_compile` + `pytest -q tests/` trên production source (hoặc clone cùng commit).
+4. Chọn cửa sổ FloodWait cooldown còn hiệu quả / 0 job `posting`, **xin phép restart 1 lần**.
+5. Sau restart: gửi `/errors` (phải có `V2 Job Held`), `/status`; kiểm tra log không có
+   `Destination history exceeds...` nữa.
+6. Cho reconciliation chạy có giám sát; nếu FloodWait → cooldown được tôn trọng, cursor
+   được lưu. Không tự giải phóng held; chỉ admin đối soát các job còn lại.
+7. Riêng watchdog: `systemctl enable --now edz-server-watchdog.timer` **chỉ khi có phê duyệt riêng**.
+
+## 7/9. Kết luận
+
+**PARTIAL — Production chưa được nâng cấp.**
+
+Code staging đã chứng minh được quá trình đối soát V2 qua kiểm thử (177/177 PASS,
+150k message, resume, lost ACK), nên **không còn lỗi FAIL ở mức code**. Tuy nhiên Production
+vẫn đang chạy bản cũ: reconciliation 25k, V2 held chưa vào `/errors`, watchdog timer inactive.
+Chỉ chuyển sang **PASS** sau khi deploy commit mới, verified `/errors` + reconciliation thực tế,
+và xử lý watchdog theo phê duyệt. Không có bằng chứng mất dữ liệu hay đăng trùng.

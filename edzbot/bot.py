@@ -21,7 +21,7 @@ from .db import DB
 from .metadata import tag
 from .pipeline import Pipeline
 from .publish_guard import (cooldown_remaining, set_cooldown, next_send_remaining,
-                            schedule_next_send, reconcile_flood_held, held_flood_rows,
+                            schedule_next_send, reconcile_flood_held, has_held_reconcilable,
                             flood_seconds_from_message)
 from .storage_policy import capacity_reason
 from .rate_schedule import count as rate_count, record as record_flood, ensure_cycle_anchor
@@ -847,7 +847,7 @@ class Service:
         """Telegram destination reconciliation must not block new intake."""
         log.info('PIPELINE v16.3.2 Reconciliation worker started')
         while True:
-            if self.cfg.auto_mode and cooldown_remaining(self.db) <= 0 and held_flood_rows(self.db):
+            if self.cfg.auto_mode and cooldown_remaining(self.db) <= 0 and has_held_reconcilable(self.db):
                 try:
                     recovered = await reconcile_flood_held(self.db, self.client, self.target)
                     log.warning('FloodWait destination reconciliation: %s', recovered)
@@ -933,7 +933,7 @@ class Service:
                     and cooldown_remaining(self.db) <= 0
                     and time.monotonic() - last_flood_reconcile >= 1800):
                 last_flood_reconcile = time.monotonic()
-                if held_flood_rows(self.db):
+                if has_held_reconcilable(self.db):
                     try:
                         recovered = await reconcile_flood_held(self.db, self.client, self.target)
                         log.warning('FloodWait destination reconciliation: %s', recovered)
