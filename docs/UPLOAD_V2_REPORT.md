@@ -182,6 +182,53 @@ gửi lại khi kết quả không rõ".
 - Không restore DB cũ (không có bài đã ACK nào bị mất). Dữ liệu canary giữ nguyên để audit.
 - **Cần phê duyệt mới** để deploy bản fix và thử lại với candidate khác.
 
+## 5c. PRODUCTION CANARY 2 — PASS (2026-11-17)
+
+Commit đã kiểm thử và deploy: **`cfa21580a3b56ebefd2f16dec070fdb589a72ea4`**.
+
+### Preflight (đều PASS)
+- Migration: `upload_jobs` production thiếu `origin`; clone DB thật → `ALTER TABLE
+  ADD COLUMN origin` thêm đúng 1 cột, giữ nguyên job `held` của canary 1, chạy
+  lần 2 không đổi gì. Không DROP/CREATE. PRAGMA trước/sau đã ghi nhận.
+- Fail-closed guard: `PUBLISHER_MODE` mặc định `paused` → **cả V1 lẫn V2 đều không
+  gửi**; `canary` bắt buộc V2=true + tên canary + concurrency 1/1; archive stream tắt.
+- Test media matrix 6/6; restart guard: chỉ đúng job canary được enqueue/claim
+  (4 artifact ready khác không bị chạm); `/v2stats` unit test PASS.
+- **145/145 test PASS** trên clone.
+- Backup mới qua Backup API: `data/backups/20261117-upload-v2-canary2/`
+  sha `16e8fddf…`, quick_check ok.
+- Candidate: `TECH.1314003.edz` · `cdcf2227…a036b` · 31,392 B · `origin=generated`
+  · đúng SHA/size trên disk · 0 trong catalog, 0 posted, 0 trên Telegram đích
+  · đúng 1 artifact `ready` với tên này (startup guard PASS).
+
+### Kết quả
+| Mục | Trước | Sau |
+|---|---|---|
+| posted | 132947 | **132948** |
+| held | 306 | 306 (job canary 1 vẫn `held`) |
+| ready | 6535 | **6534** |
+| max target msg | 132952 | **132953** |
+| Telegram msg ID | — | **132953** |
+| caption xác minh | — | `File: TECH.1314003.edz`, `SHA-256: cdcf2227…a036b` ✓ |
+| ACK SQLite | — | `upload_jobs(posted, target_message=132953, origin=generated)`, `artifacts(posted, normalized_name, msg=132953)`, event `ack` ✓ |
+| FloodWait / retry / duplicate | — | **0 / 0 / 0** |
+| Thời gian | — | restart 02:47:03 → posted 02:47:07 (~4s, log xác nhận) |
+| Tốc độ | — | không báo MiB/s (file 31 KB, upload 1 chunk — không đại diện) |
+
+- Service: PID **4049070**, NRestarts=0, active/running. Log: `CANARY GUARD PASS`,
+  `Upload Engine V2 active (concurrency=1/1)`, `V2 Posted EDZ ... #132953`.
+- `/v2stats` trả lời trên Control Bot (msg #3400/#3401); unit test cũng PASS.
+- Hàng đợi sau canary: ONLY 2 job — canary1 `held`, canary2 `posted`. **Không mở backlog**.
+- Gate đã chuyển `PUBLISHER_MODE=paused`, `UPLOAD_ENGINE_V2=false`, xóa tên canary
+  trong `.env` ngay sau lượt thử (không restart lần 2). Restart sau đó → V1 lẫn V2
+  đều không gửi.
+
+### Ghi chú còn tồn
+- `edz_name_catalog` **không có row** cho tên canary (ACK chỉ UPDATE nếu row đã tồn
+  tại). Dedup vẫn đảm bảo qua `upload_name_owners` + `artifacts.normalized_name=posted`.
+- Caption brand hiển thị `EPLAN EDZ | EPLAN EDZ` (artifact `origin=generated` không
+  có brand) — cosmetic, không ảnh hưởng định danh SHA/EDZID.
+
 ## 6. Giới hạn đã biết / rủi ro phải biết
 
 1. **`artifacts.sha256 PRIMARY KEY` vẫn còn** — V2 tách danh tính tên sang bảng phụ,
