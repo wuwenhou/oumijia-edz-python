@@ -302,6 +302,24 @@ Commit: `398047c` (sau `76d3b71`) · **150/150 test PASS**.
 - Không đụng chính sách upload, không thêm Publisher, **không deploy/restart
   production** khi chưa có phê duyệt riêng.
 
+## 5g. THIẾT KẾ LẠI CONTROL BOT (staging only, chưa deploy)
+
+- `/help` thay bằng đúng bảng plain-text bắt buộc: **không dòng trống, không
+  dấu nháy, không Markdown**, 15 dòng sát nhau. Test so sánh chuỗi chính xác.
+- `/files` = `/files` + `/check` (có `/files Ten-goi.7z N`); `/check` là alias ẩn.
+- `/status` = `/status` + `/v2stats`: lịch sử (artifacts) tách riêng stats phiên V2,
+  gồm concurrency, file/phút, MiB/s, FloodWait, duplicate, cooldown. `/v2stats` là alias.
+- `/health` = `/health` + `/server` + `/cpu` + `/ram` + `/disk` + `/uptime`;
+  alias chuyên sâu vẫn đọc riêng nhưng ẩn khỏi help.
+- `/errors` giữ đủ `summary/158/SHA256/csv/files` + alias `/errorscsv`, `/errorsfiles`.
+- `/limit`, `/speed`, `/stream7z` ẩn; pacing và `UPLOAD_ARCHIVE_STREAM_ENABLED=false`
+  **không đổi**. Không đụng Publisher, SQLite,Delay hay concurrency.
+- Backup trước khi sửa: `data/backups/20261117-control-bot-help-redesign/`
+  (source + `.env` + SHA256SUMS).
+- **162/162 test PASS** trên clone (full suite), gồm help exact, parser/alias,
+  admin gate, status fields, health alias modes.
+- Production vẫn chạy commit `398047c`, PID 4051500, **không restart, không deploy**.
+
 ## 6. Giới hạn đã biết / rủi ro phải biết
 
 1. **`artifacts.sha256 PRIMARY KEY` vẫn còn** — V2 tách danh tính tên sang bảng phụ,

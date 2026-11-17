@@ -203,6 +203,41 @@ class Service:
                                   + (display or 'Không có file chờ')
                                   + ('\n...và các file khác' if len(rows) > 15 else ''))
 
+    async def _status_notice(self):
+        """Concise status: historical totals + current V2 session stats."""
+        counts = {x['state']: x['count'] for x in self.db.stats()['artifacts']}
+        parts = [
+            '📊 OUMIJIA — Trạng thái',
+            f'📜 Lịch sử: Đã đăng {counts.get("posted",0)} · '
+            f'Chờ {counts.get("ready",0)} · Held {counts.get("held",0)}',
+        ]
+        if self.upload_engine is not None:
+            s = self.upload_engine.stats.snapshot()
+            parts.append(
+                f'🚀 V2: BẬT · concurrency '
+                f'{self.upload_engine.governor.current}/{self.upload_engine.governor.maximum}\n'
+                f'   Đã đăng (phiên này): {s["files"]} · '
+                f'{s["files_per_min"]} file/phút · {s["mib_per_s"]} MiB/s\n'
+                f'   FloodWait: {s["floodwaits"]} · duplicate: {s["duplicates"]}\n'
+                f'   Pacing: cố định — V2 không tự đổi khoảng nghỉ'
+            )
+        else:
+            parts.append('🚀 V2: TẮT (đang dùng Publisher V1)')
+        parts.append(f'⏳ Cooldown: {round(cooldown_remaining(self.db))} giây')
+        await self._manual_notice('\n'.join(parts))
+
+    async def _health_notice(self, verb: str):
+        """Merged /health with hidden deep-read aliases (/cpu, /ram, ...)."""
+        try:
+            current = await asyncio.to_thread(
+                server_snapshot, self.cfg.data, self.cfg.reserve_bytes)
+            mode = 'server' if verb in ('server', 'health') else verb
+            text = format_snapshot(current, mode=mode)
+        except Exception:
+            log.exception('Không lấy được tài nguyên server')
+            text = '⚠️ Không đọc được thông số server; xem nhật ký.'
+        await self._manual_notice(text)
+
     async def handle_manual(self, msg):
         """Single room, authorized admin commands, no implicit download on upload."""
         if not message_allowed(msg, self.inbox_allowed):
@@ -223,24 +258,9 @@ class Service:
                 log.exception('V2 archive stream command failed')
                 await self._manual_notice('⚠️ V2 stream 7z thất bại: ' + str(ex)[:300])
             return
-        # V2 stats is handled here (parse_command has no such verb).
+        # /v2stats is a hidden compatibility alias of the merged /status.
         if text.strip().lower() in ('/v2stats', 'v2stats'):
-            if self.upload_engine is None:
-                await self._manual_notice('Upload Engine V2 chưa được bật (UPLOAD_ENGINE_V2=false).')
-            else:
-                s = self.upload_engine.stats.snapshot()
-                q = {r['state']: r['n'] for r in self.db.execute(
-                    'SELECT state,COUNT(*) n FROM upload_jobs GROUP BY state').fetchall()}
-                await self._manual_notice(
-                    '⚙️ OUMIJIA — Upload Engine V2\n'
-                    f'Concurrency: {self.upload_engine.governor.current}/'
-                    f'{self.upload_engine.governor.maximum}\n'
-                    f'Đã đăng: {s["files"]} ({s["mib"]} MiB), {s["mib_per_s"]} MiB/s, '
-                    f'{s["files_per_min"]} file/phút\n'
-                    f'ACK trung bình: {s["avg_ack_s"]}s\n'
-                    f'FloodWait: {s["floodwaits"]}, duplicate: {s["duplicates"]}, '
-                    f'retry: {s["retries"]}\n'
-                    f'Hàng đợi: {q}')
+            await self._status_notice()
             return
         # OUMIJIA_REVIEW_CSV_V023: admin-only read-only report requests
         from .review_reports import (parse_request, query_held, csv_bytes,
@@ -281,16 +301,21 @@ class Service:
             verb, group_name, expected = command
             if verb in ('start','help'):
                 await self._manual_notice(
-                    '🤖 OUMIJIA — TRUNG TÂM ĐIỀU KHIỂN\n\n'
-                    '- "/help" — Xem hướng dẫn.\n'
-                    '- "/files" — Xem file chờ duyệt; thêm "Ten-goi.7z N" để kiểm tra bộ nén.\n'
-                    '- "/process" — Duyệt tải và xử lý file.\n'
-                    '- "/cancel" — Hủy các file chưa bắt đầu.\n'
-                    '- "/status" — Trạng thái EDZ, Upload V2 và tốc độ đăng.\n'
-                    '- "/health" — CPU, RAM, SSD và dịch vụ.\n'
-                    '- "/errors" — Xem lỗi; thêm "csv"/"files" để xuất báo cáo.\n\n'
-                    '🔒 Chỉ quản trị viên được phép điều khiển. '
-                    'File gửi vào nhóm chỉ được ghi nhận; cần "/process" để duyệt tải và xử lý.')
+                    '🤖 OUMIJIA — TRUNG TÂM ĐIỀU KHIỂN\n'
+                    '📦 QUẢN LÝ EDZ\n'
+                    '/files — Xem file đang chờ duyệt.\n'
+                    '/process — Duyệt tải và xử lý file.\n'
+                    '/cancel — Hủy file chưa bắt đầu.\n'
+                    '📊 HỆ THỐNG\n'
+                    '/status — Trạng thái EDZ, Upload V2 và tốc độ.\n'
+                    '/health — CPU, RAM, SSD và dịch vụ.\n'
+                    '/errors — Xem lỗi cần xử lý.\n'
+                    '⚙️ HƯỚNG DẪN\n'
+                    '/help — Xem bảng điều khiển.\n'
+                    '📝 LỆNH MỞ RỘNG\n'
+                    '/errors 158 — Xem chi tiết lỗi theo ID.\n'
+                    '/errors csv — Xuất báo cáo lỗi.\n'
+                    '🔒 Chỉ quản trị viên được phép điều khiển. File gửi vào nhóm cần được duyệt bằng /process trước khi xử lý.')
                 return
             if verb in ('files', 'check'):
                 await self._files_notice(group_name, expected)
@@ -321,32 +346,11 @@ class Service:
                 await self._manual_notice(f'🛑 Đã hủy {stopped} file thủ công đang chờ. '
                     'File đang tải/đang gửi sẽ kết thúc tại điểm an toàn, không tự ngắt giữa chừng.')
                 return
-            if verb == 'status':
-                stats = self.db.stats()
-                a = {x['state']: x['count'] for x in stats['artifacts']}
-                staged = staged_summary(self.db)
-                delay_source = 'Telegram /limit' if override_delay(self.db) is not None else 'SEND_DELAY_SECONDS'
-                await self._manual_notice(
-                    '📊 OUMIJIA — Trạng thái\n'
-                    f'📜 Lịch sử — Đã đăng: {a.get("posted",0)}\n'
-                    f'Chờ đăng: {a.get("ready",0)}\n'
-                    f'Lỗi giữ lại: {a.get("held",0)}\n'
-                    f'File thủ công chưa duyệt: {staged[0]} file + {staged[1]} phần 7z\n'
-                    f'EDZ từng gặp FloodWait: {rate_count(self.db)}\n'
-                    f'Khoảng nghỉ hiện tại: {current_delay(self.db, self.cfg):g} giây '
-                    f'(nguồn: {delay_source}; 0 = không giới hạn)\n'
-                    + self._pipeline_status_short_v163()
-                    + self._v2_status_short()
-                    + f'Telegram yêu cầu chờ thêm: {round(cooldown_remaining(self.db))} giây')
+            if verb in ('status', 'v2stats'):
+                await self._status_notice()
                 return
             if verb in ('server', 'health', 'cpu', 'ram', 'disk', 'uptime'):
-                try:
-                    current = await asyncio.to_thread(
-                        server_snapshot, self.cfg.data, self.cfg.reserve_bytes)
-                    await self._manual_notice(format_snapshot(current, mode=verb))
-                except Exception:
-                    log.exception('Không lấy được tài nguyên server')
-                    await self._manual_notice('⚠️ Không đọc được thông số server; xem nhật ký giám sát.')
+                await self._health_notice(verb)
                 return
             if verb == 'speed':
                 delay = current_delay(self.db, self.cfg)

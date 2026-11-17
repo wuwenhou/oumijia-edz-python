@@ -299,5 +299,5 @@ def test_v2stats_command_replies(monkeypatch):
     monkeypatch.setattr('edzbot.bot.message_allowed', lambda m, a: True)
     message = type('M', (), {'raw_text': '/v2stats'})()
     asyncio.run(s.handle_manual(message))
-    assert out and 'UPLOAD_ENGINE_V2' in out[0]
+    assert out and 'OUMIJIA — Trạng thái' in out[0] and 'V2' in out[0]
     s.db.close()

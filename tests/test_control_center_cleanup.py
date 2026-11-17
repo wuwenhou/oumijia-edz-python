@@ -69,8 +69,27 @@ def test_non_admin_command_is_ignored(monkeypatch):
     s.db.close()
 
 
-# ---- 3. help: exactly 7 main commands, no /limit or /speed ----------------
-def test_help_shows_only_seven_commands(monkeypatch):
+# ---- 3. help: EXACT mandated plain-text board -----------------------------
+MANDATED_HELP = (
+    '🤖 OUMIJIA — TRUNG TÂM ĐIỀU KHIỂN\n'
+    '📦 QUẢN LÝ EDZ\n'
+    '/files — Xem file đang chờ duyệt.\n'
+    '/process — Duyệt tải và xử lý file.\n'
+    '/cancel — Hủy file chưa bắt đầu.\n'
+    '📊 HỆ THỐNG\n'
+    '/status — Trạng thái EDZ, Upload V2 và tốc độ.\n'
+    '/health — CPU, RAM, SSD và dịch vụ.\n'
+    '/errors — Xem lỗi cần xử lý.\n'
+    '⚙️ HƯỚNG DẪN\n'
+    '/help — Xem bảng điều khiển.\n'
+    '📝 LỆNH MỞ RỘNG\n'
+    '/errors 158 — Xem chi tiết lỗi theo ID.\n'
+    '/errors csv — Xuất báo cáo lỗi.\n'
+    '🔒 Chỉ quản trị viên được phép điều khiển. File gửi vào nhóm cần được duyệt bằng /process trước khi xử lý.'
+)
+
+
+def test_help_is_exact_mandated_text(monkeypatch):
     s = object.__new__(Service)
     s.cfg = SimpleNamespace(publisher_mode='normal', upload_engine_v2=True)
     s.db = DB(Path(':memory:'))
@@ -82,14 +101,16 @@ def test_help_shows_only_seven_commands(monkeypatch):
     s._manual_notice = notice
     monkeypatch.setattr('edzbot.bot.message_allowed', lambda m, a: True)
     asyncio.run(s.handle_manual(type('M', (), {'sender_id': 1, 'raw_text': '/help'})()))
-    text = out[0]
-    commands = [line.strip().split('"')[1] for line in text.splitlines()
-                if line.strip().startswith('- "/')]
-    assert commands == ['/help', '/files', '/process', '/cancel',
-                        '/status', '/health', '/errors']
-    assert '/limit' not in text and '/speed' not in text
-    assert '/check' not in text
+    assert out == [MANDATED_HELP]
+    assert '\n\n' not in out[0]
+    assert '"' not in out[0] and "'" not in out[0]
     s.db.close()
+
+
+def test_hidden_help_aliases_parse():
+    for verb in ('check', 'server', 'cpu', 'ram', 'disk', 'uptime',
+                 'v2stats', 'speed', 'limit'):
+        assert parse_command(f'/{verb}') == (verb, None, None)
 
 
 # ---- 4. /files group inspection (merged /check) ----------------------------
@@ -128,4 +149,58 @@ def test_status_distinguishes_session_and_history():
     assert 'SEND_DELAY_SECONDS=3s' in text
     assert 'không tự đổi khoảng nghỉ' in text
     assert 'PHIÊN NÀY' in text
+    s.db.close()
+
+
+def test_status_notice_covers_all_required_fields():
+    s = object.__new__(Service)
+    s.db = DB(Path(':memory:'))
+    s.upload_engine = SimpleNamespace(
+        stats=UploadStats(),
+        governor=SimpleNamespace(current=1, maximum=1),
+        faulted=False)
+    s.upload_engine.stats.record_upload(2 * 1024**2, 0.5)
+    out = []
+    async def notice(t):
+        out.append(t)
+    s._manual_notice = notice
+    asyncio.run(s._status_notice())
+    text = out[0]
+    for needle in ('📜 Lịch sử', '🚀 V2: BẬT', 'concurrency 1/1',
+                   'file/phút', 'MiB/s', 'FloodWait', 'Cooldown'):
+        assert needle in text, needle
+    s.db.close()
+
+
+def test_health_alias_modes(monkeypatch):
+    import edzbot.bot as botmod
+    s = object.__new__(Service)
+    s.cfg = SimpleNamespace(data=Path('/tmp'), reserve_bytes=1024)
+    out = []
+    modes = []
+    async def notice(t):
+        out.append(t)
+    s._manual_notice = notice
+    monkeypatch.setattr(botmod, 'server_snapshot', lambda *a, **k: {'x': 1})
+    monkeypatch.setattr(botmod, 'format_snapshot',
+                        lambda snap, mode='server': modes.append(mode) or 'HEALTH')
+    for verb in ('server', 'health', 'cpu', 'ram', 'disk', 'uptime'):
+        asyncio.run(s._health_notice(verb))
+    assert modes == ['server', 'server', 'cpu', 'ram', 'disk', 'uptime']
+    assert out == ['HEALTH'] * 6
+
+
+def test_v2stats_alias_uses_status(monkeypatch):
+    s = object.__new__(Service)
+    s.cfg = SimpleNamespace(publisher_mode='normal', upload_engine_v2=True)
+    s.db = DB(Path(':memory:'))
+    s.upload_engine = None
+    s.inbox_allowed = frozenset({1})
+    out = []
+    async def notice(t):
+        out.append(t)
+    s._manual_notice = notice
+    monkeypatch.setattr('edzbot.bot.message_allowed', lambda m, a: True)
+    asyncio.run(s.handle_manual(type('M', (), {'sender_id': 1, 'raw_text': '/v2stats'})()))
+    assert out and out[0].startswith('📊 OUMIJIA — Trạng thái')
     s.db.close()

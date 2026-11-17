@@ -189,6 +189,7 @@ def parse_command(text: str) -> tuple[str, str | None, int | None] | None:
         if re.fullmatch(r'(\d+(?:\.\d+)?|reset)', arg, re.IGNORECASE):
             return 'limit', arg.lower(), None
         raise ValueError('Dùng /limit để xem, /limit 3 đặt 3 giây, /limit 0 không giới hạn, hoặc /limit reset')
-    if command in ('start','help','files','check','status','errors','cancel','server','health','cpu','ram','disk','uptime','speed') and not arg:
+    if command in ('start','help','files','check','status','v2stats','errors','cancel',
+                   'server','health','cpu','ram','disk','uptime','speed') and not arg:
         return command, None, None
     return None
