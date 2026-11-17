@@ -258,6 +258,7 @@ def test_media_reuse_avoids_reupload(tmp_path):
     e.enqueue('Reuse.edz', digest, str(p), 10)
     j = dict(db.execute('SELECT * FROM upload_jobs').fetchone())
     j['source_message'] = 55
+    j['origin'] = 'direct'
     e.source = 'SOURCE'
     p.write_bytes(b'x' * 10)
     assert asyncio.run(e.publish(j)) is True
@@ -386,6 +387,26 @@ def test_preflight5_ambiguous_never_auto_resends():
     asyncio.run(e.publish_batch())
     asyncio.run(e.publish_batch())
     assert len(client.calls) == before      # no auto-resend across scheduler ticks
+
+
+def test_no_media_reuse_for_generated_or_protected_source(tmp_path):
+    db = fresh_db()
+    p = tmp_path / 'g.edz'
+    p.write_bytes(b'g' * 10)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    media = object()
+    client = FakeClient(media=type('M', (), {
+        'media': media, 'noforwards': False,
+        'chat': type('C', (), {'noforwards': True})()})())   # protected channel
+    e = make_engine(db, client)
+    e.enqueue('Generated.edz', digest, str(p), 10, origin='generated')
+    j = dict(db.execute('SELECT * FROM upload_jobs').fetchone())
+    j['source_message'] = 105
+    e.source = 'SOURCE'
+    assert asyncio.run(e.publish(j)) is True
+    # local bytes uploaded, never the protected source media
+    assert client.calls[0][1] is not media
+    assert isinstance(client.calls[0][1], Path)
 
 
 def test_canary_gate_blocks_backlog():

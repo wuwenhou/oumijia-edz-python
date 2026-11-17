@@ -173,7 +173,7 @@ class UploadEngine:
 
     def enqueue(self, name: str, sha: str, path: str, size: int,
                 *, source_message: int | None = None, brand: str | None = None,
-                part: str | None = None) -> bool:
+                part: str | None = None, origin: str | None = None) -> bool:
         """Atomically claim the name AND enqueue the job in ONE transaction.
 
         A crash between the two statements would otherwise leave an owned name
@@ -201,9 +201,10 @@ class UploadEngine:
                 return False
             self.db.execute(
                 'INSERT OR IGNORE INTO upload_jobs'
-                '(normalized_name,sha256,file_name,path,size_bytes,source_message,state,created_at,updated_at)'
-                ' VALUES(?,?,?,?,?,?,?,?,?)',
-                (norm, sha, name, str(path), int(size), source_message, 'queued', now, now))
+                '(normalized_name,sha256,file_name,path,size_bytes,source_message,origin,state,created_at,updated_at)'
+                ' VALUES(?,?,?,?,?,?,?,?,?,?)',
+                (norm, sha, name, str(path), int(size), source_message, origin,
+                 'queued', now, now))
             self.db.execute(
                 'INSERT INTO upload_events(at,normalized_name,kind,detail) VALUES(?,?,?,?)',
                 (now, norm, 'enqueued', f'sha={sha[:16]} size={size}'))
@@ -224,7 +225,7 @@ class UploadEngine:
                 continue
             if self.enqueue(a['file_name'], a['sha256'], a['path'], a['size_bytes'],
                             source_message=a['source_message'],
-                            brand=a['brand'], part=a['part_number']):
+                            brand=a['brand'], part=a['part_number'], origin=a['origin']):
                 n += 1
         return n
 
@@ -349,12 +350,16 @@ class UploadEngine:
 
         media = path
         src = job.get('source_message')
-        # Reuse valid source media to avoid re-uploading multi-GB originals.
-        if self.source is not None and src and src > 0:
+        # Reuse source media ONLY for direct-origin artifacts from a source that
+        # permits forwarding. Protected channels set chat.noforwards=True even
+        # when message.noforwards=False (canary finding 2026-11-17).
+        if (self.source is not None and src and src > 0
+                and job.get('origin') == 'direct'):
             try:
                 original = await self.client.get_messages(self.source, ids=src)
-                if (original and getattr(original, 'media', None)
-                        and not getattr(original, 'noforwards', False)):
+                protected = (getattr(original, 'noforwards', False) or
+                             getattr(getattr(original, 'chat', None), 'noforwards', False))
+                if original and getattr(original, 'media', None) and not protected:
                     media = original.media
             except Exception:
                 log.debug('Source media lookup failed; uploading local bytes', exc_info=True)

@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS upload_jobs (
     source_message INTEGER,
     state TEXT NOT NULL DEFAULT 'queued',
     attempts INTEGER NOT NULL DEFAULT 0,
+    origin TEXT,
     target_message INTEGER,
     error TEXT,
     created_at REAL NOT NULL,

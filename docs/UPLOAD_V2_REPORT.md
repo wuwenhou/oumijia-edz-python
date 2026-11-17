@@ -122,6 +122,66 @@ ambiguous_jobs_auto_resent: []    no_auto_resend: true
 
 ---
 
+## 5b. PRODUCTION CANARY — KẾT QUẢ FAIL (an toàn, 2026-11-17)
+
+**Phạm vi được phê duyệt:** 1 EDZ thật trên kênh đích `-1004349174061` sau khi
+preflight PASS. Không mở backlog, không tăng concurrency.
+
+### Preflight (đều PASS trước khi deploy)
+- 5 điều kiện bắt buộc → 135/135 test PASS (sau đó 136/136 khi thêm fix media).
+- Candidate: `TECH.1272001H9.edz` · SHA `e1b6e53be178f3113fdae5af1544014a4eec0d9f62c62f6446861919f3e7d3e5`
+  · 31,308 bytes · state `ready` · **không** có trong `edz_name_catalog`, không posted,
+  không có trên kênh đích (Telegram search = 0) · file trên disk đúng SHA/size.
+- Backup: `data/backups/20261117-upload-v2-canary/` — SQLite **Backup API**,
+  `quick_check=ok`, posted 132947 / held 306 / ready 6535, max msg 132952;
+  backup source `.env` + systemd unit; sha256 ghi trong `SHA256SUMS`.
+- Chỉ 1 Publisher (`python -m edzbot run` PID 3927992), Rust inactive.
+- Deploy 6 file, sha256 local == production. Restart **1 lần**: PID 4047067, NRestarts=0.
+
+### FloodWait — đã chờ đúng (tuân thủ)
+Legacy publisher set cooldown đến **02:36:15 UTC** (FloodWait 01:41:18). Không xóa
+khóa này; đợi đúng ~45 phút mới cho canary chạy.
+
+### Kết quả thử — FAIL, KHÔNG có bài đăng nào được tạo
+| Mục | Giá trị |
+|---|---|
+| Tên EDZ | TECH.1272001H9.edz |
+| SHA256 / size | e1b6e53b…3e5 / 31,308 bytes |
+| Job | `state=held`, `attempts=1`, `target_message=NULL` |
+| Lỗi | `Ambiguous posting outcome: You can't forward messages from a protected chat (caused by SendMediaRequest)` |
+| Bài trùng trên đích | **0** (search = []) |
+| latest dest message id | **132952** (không đổi) |
+| posted/held/ready trước | 132947 / 306 / 6535 |
+| posted/held/ready sau | **132947 / 306 / 6535** (không đổi) |
+| Duplicate post | 0 |
+| FloodWait trong lượt thử | 0 (đã đợi cooldown cũ) |
+| Auto-retry | **0** — held, không gửi lại |
+| Control Bot | active, trả lời /status bình thường |
+| `/v2stats` | **không trả lời** (lỗi riêng, xem bên dưới) |
+
+### Nguyên nhân (đã xác nhận read-only)
+`artifacts.origin='generated'` nhưng V2 vẫn cố reuse media từ `source_message=105`
+(legacy chỉ reuse khi `origin='direct'`). Hơn nữa message có `noforwards=False`
+nhưng `chat.noforwards=True` (kênh nguồn được bảo vệ) → Telegram từ chối.
+Telegram **từ chối trước khi tạo bài** (max msg không đổi), nhưng engine phân loại
+mọi exception không-FloodWait là `ambiguous` → `held`. Đúng chính sách "không tự
+gửi lại khi kết quả không rõ".
+
+### Đã xử lý trong staging (chưa deploy lại)
+- Chỉ reuse media khi `origin='direct'` **và** `not message.noforwards`
+  **và** `not message.chat.noforwards`; nếu không thì upload byte từ file local.
+- Thêm cột `origin` vào `upload_jobs` (additive).
+- Sửa `/v2stats`: xử lý trước `parse_command` (verb này không nằm trong parser).
+- Test mới cho 2 trường hợp trên → **136/136 PASS**.
+
+### Trạng thái production hiện tại
+- `.env`: `UPLOAD_ENGINE_V2=false` (ghi nhận để lần start sau; **không restart lần 2**).
+- Tiến trình đang chạy vẫn có V2 active nhưng **vô hiệu**: canary gate chỉ cho phép
+  đúng 1 tên, job đó đã `held` → `claim_next()` không trả job nào. Không có bài nào
+  sẽ được gửi thêm.
+- Không restore DB cũ (không có bài đã ACK nào bị mất). Dữ liệu canary giữ nguyên để audit.
+- **Cần phê duyệt mới** để deploy bản fix và thử lại với candidate khác.
+
 ## 6. Giới hạn đã biết / rủi ro phải biết
 
 1. **`artifacts.sha256 PRIMARY KEY` vẫn còn** — V2 tách danh tính tên sang bảng phụ,

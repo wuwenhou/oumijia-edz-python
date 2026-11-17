@@ -176,6 +176,25 @@ class Service:
                 log.exception('V2 archive stream command failed')
                 await self._manual_notice('⚠️ V2 stream 7z thất bại: ' + str(ex)[:300])
             return
+        # V2 stats is handled here (parse_command has no such verb).
+        if text.strip().lower() in ('/v2stats', 'v2stats'):
+            if self.upload_engine is None:
+                await self._manual_notice('Upload Engine V2 chưa được bật (UPLOAD_ENGINE_V2=false).')
+            else:
+                s = self.upload_engine.stats.snapshot()
+                q = {r['state']: r['n'] for r in self.db.execute(
+                    'SELECT state,COUNT(*) n FROM upload_jobs GROUP BY state').fetchall()}
+                await self._manual_notice(
+                    '⚙️ OUMIJIA — Upload Engine V2\n'
+                    f'Concurrency: {self.upload_engine.governor.current}/'
+                    f'{self.upload_engine.governor.maximum}\n'
+                    f'Đã đăng: {s["files"]} ({s["mib"]} MiB), {s["mib_per_s"]} MiB/s, '
+                    f'{s["files_per_min"]} file/phút\n'
+                    f'ACK trung bình: {s["avg_ack_s"]}s\n'
+                    f'FloodWait: {s["floodwaits"]}, duplicate: {s["duplicates"]}, '
+                    f'retry: {s["retries"]}\n'
+                    f'Hàng đợi: {q}')
+            return
         # OUMIJIA_REVIEW_CSV_V023: admin-only read-only report requests
         from .review_reports import (parse_request, query_held, csv_bytes,
                                      summary_text, detail_text, send_document)
@@ -310,24 +329,6 @@ class Service:
                     f'(nguồn: {delay_source}; 0 = không giới hạn)\n'
                     + self._pipeline_status_short_v163()
                     + f'Telegram yêu cầu chờ thêm: {round(cooldown_remaining(self.db))} giây')
-                return
-            if verb == 'v2stats':
-                if self.upload_engine is None:
-                    await self._manual_notice('Upload Engine V2 chưa được bật (UPLOAD_ENGINE_V2=false).')
-                else:
-                    s = self.upload_engine.stats.snapshot()
-                    q = {r['state']: r['n'] for r in self.db.execute(
-                        "SELECT state,COUNT(*) n FROM upload_jobs GROUP BY state").fetchall()}
-                    await self._manual_notice(
-                        '⚙️ OUMIJIA — Upload Engine V2\n'
-                        f'Concurrency: {self.upload_engine.governor.current}/'
-                        f'{self.upload_engine.governor.maximum}\n'
-                        f'Đã đăng: {s["files"]} ({s["mib"]} MiB), {s["mib_per_s"]} MiB/s, '
-                        f'{s["files_per_min"]} file/phút\n'
-                        f'ACK trung bình: {s["avg_ack_s"]}s\n'
-                        f'FloodWait: {s["floodwaits"]}, duplicate: {s["duplicates"]}, '
-                        f'retry: {s["retries"]}\n'
-                        f'Hàng đợi: {q}')
                 return
             if verb in ('server', 'health', 'cpu', 'ram', 'disk', 'uptime'):
                 try:
