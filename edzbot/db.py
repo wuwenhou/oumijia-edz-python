@@ -83,12 +83,30 @@ CREATE TABLE IF NOT EXISTS upload_events (
 """
 
 
+def migrate_upload_jobs(conn):
+    """Idempotent, additive migration for the pre-canary V2 schema.
+
+    Production already has upload_jobs WITHOUT `origin`. CREATE TABLE IF NOT
+    EXISTS never adds a column to an existing table, so add it explicitly.
+    ALTER preserves every row (including the held canary-1 job). No DROP, no
+    CREATE replacement, no data rewrite. Safe to run on every startup.
+    """
+    if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upload_jobs'"
+    ).fetchone():
+        return                      # fresh DB: SCHEMA already created the column
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(upload_jobs)')}
+    if 'origin' not in cols:
+        conn.execute('ALTER TABLE upload_jobs ADD COLUMN origin TEXT')
+
+
 class DB:
     def __init__(self, path: Path):
         path.parent.mkdir(exist_ok=True, parents=True)
         self.conn = sqlite3.connect(str(path), isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        migrate_upload_jobs(self.conn)
 
     def close(self): self.conn.close()
 

@@ -251,7 +251,9 @@ def test_single_publisher_no_duplicate_on_restart():
 def test_media_reuse_avoids_reupload(tmp_path):
     db = fresh_db()
     media = object()
-    client = FakeClient(media=type('M', (), {'media': media, 'noforwards': False})())
+    client = FakeClient(media=type('M', (), {
+        'media': media, 'noforwards': False,
+        'chat': type('C', (), {'noforwards': False})()})())
     e = make_engine(db, client)
     p = tmp_path / 'reuse.edz'
     digest = hashlib.sha256(b'x' * 10).hexdigest()

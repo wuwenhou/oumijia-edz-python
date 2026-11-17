@@ -74,6 +74,8 @@ class Config:
     upload_max_retries: int
     upload_temp_dir: str
     upload_canary_name: str
+    publisher_mode: str
+    upload_archive_stream_enabled: bool
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> 'Config':
@@ -142,6 +144,8 @@ class Config:
             upload_max_retries=int(os.getenv('UPLOAD_MAX_RETRIES', '3')),
             upload_temp_dir=os.getenv('UPLOAD_TEMP_DIR', '').strip(),
             upload_canary_name=os.getenv('UPLOAD_CANARY_NAME', '').strip(),
+            publisher_mode=os.getenv('PUBLISHER_MODE', 'paused').strip().lower(),
+            upload_archive_stream_enabled=_boolean('UPLOAD_ARCHIVE_STREAM_ENABLED', False),
         )
         if (cfg.max_archive_files < 1 or cfg.max_unpack_bytes < 1 or cfg.poll_seconds < 1
                 or cfg.max_group_bytes <= 0 or cfg.plan_max_pending_artifacts < 1
@@ -161,6 +165,17 @@ class Config:
                  cfg.upload_concurrency > cfg.upload_max_concurrency or
                  cfg.upload_max_retries < 0)):
             raise ValueError('UPLOAD_* limits: concurrency must be 1 or 2, retries >= 0')
+        # Fail-closed publisher gate: default 'paused' means NOTHING may publish,
+        # including the legacy V1 path. Canary mode is the only approved writer.
+        if cfg.publisher_mode not in ('paused', 'canary', 'normal'):
+            raise ValueError('PUBLISHER_MODE must be paused, canary or normal')
+        if cfg.publisher_mode == 'canary' and not (
+                cfg.upload_engine_v2 and cfg.upload_canary_name
+                and cfg.upload_concurrency == 1 and cfg.upload_max_concurrency == 1):
+            raise ValueError('Canary requires UPLOAD_ENGINE_V2=true, a canary name, '
+                             'and UPLOAD_CONCURRENCY=UPLOAD_MAX_CONCURRENCY=1')
+        if cfg.publisher_mode == 'normal' and cfg.upload_engine_v2:
+            raise ValueError('PUBLISHER_MODE=normal must not enable V2 (full rollout not approved)')
         # Single private control group. The BotFather bot replies in that same room.
         if cfg.inbox_chat is not None:
             if not isinstance(cfg.inbox_chat, int) or cfg.inbox_chat >= 0:

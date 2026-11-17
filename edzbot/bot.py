@@ -98,6 +98,7 @@ class Service:
         self.target = None
         self.inbox = None
         self.inbox_allowed = cfg.inbox_user_ids
+        self.publisher_mode = cfg.publisher_mode
         self.upload_engine = None
         if cfg.upload_engine_v2:
             self.upload_engine = UploadEngine(
@@ -108,7 +109,8 @@ class Service:
                     max_concurrency=cfg.upload_max_concurrency,
                     max_retries=cfg.upload_max_retries,
                     max_upload_bytes=cfg.max_upload_bytes,
-                    canary_name=cfg.upload_canary_name),
+                    canary_name=cfg.upload_canary_name,
+                    canary_mode=(cfg.publisher_mode == 'canary')),
                 get_delay=lambda: current_delay(self.db, self.cfg),
                 sysinfo=lambda: server_snapshot(self.cfg.data, self.cfg.reserve_bytes),
             )
@@ -166,6 +168,9 @@ class Service:
         text = getattr(msg, 'raw_text', '') or ''
         # Admin-only: stream an already-staged 7z through the V2 publisher.
         if text.strip().lower().startswith('/stream7z '):
+            if not self.cfg.upload_archive_stream_enabled:
+                await self._manual_notice('⚠️ Streaming archive bị tắt (UPLOAD_ARCHIVE_STREAM_ENABLED=false).')
+                return
             arg = text.strip().split(None, 1)[1]
             try:
                 result = await self.publish_archive_v2(Path(arg))
@@ -971,7 +976,8 @@ class Service:
             await self.process_volume_groups()
             a = self.db.next_artifact(allow_unverified=self.cfg.allow_unverified,
                                       require_complete_source=self.cfg.auto_mode)
-            if (a and not self.cfg.dry_run and self.upload_engine is None
+            if (a and not self.cfg.dry_run and self.publisher_mode == 'normal'
+                    and self.upload_engine is None
                     and next_send_remaining(self.db) <= 0):
                 await self.publish_one(a)
                 continue
@@ -1047,7 +1053,10 @@ class Service:
 
     async def publish_worker_v163(self):
         """SINGLE publisher; preserve SHA, FloodWait, and ambiguous-send guards."""
-        log.info('PIPELINE v16.3 Publisher started')
+        log.info('PIPELINE v16.3 Publisher started (mode=%s)', self.publisher_mode)
+        if self.publisher_mode == 'paused':
+            log.warning('Publisher GATE=paused: no V1 or V2 post will be sent on restart')
+            return
         if self.upload_engine is not None:
             log.info('Upload Engine V2 active (concurrency=%d/%d, canary=%s)',
                      self.cfg.upload_concurrency, self.cfg.upload_max_concurrency,
@@ -1105,6 +1114,19 @@ class Service:
             if self.upload_engine is not None:
                 self.upload_engine.target = self.target
                 self.upload_engine.source = self.source
+            if self.publisher_mode == 'canary':
+                # Fail-closed startup guard: exactly ONE ready artifact may exist
+                # for the configured canary name, or the service must not run.
+                from .name_guard import normalize_edz_name
+                want = normalize_edz_name(self.cfg.upload_canary_name)
+                matches = [a for a in self.db.execute(
+                    "SELECT file_name FROM artifacts WHERE state='ready'")
+                    if normalize_edz_name(a['file_name']) == want]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f'CANARY GUARD: expected exactly 1 ready artifact for '
+                        f'{self.cfg.upload_canary_name}, found {len(matches)}')
+                log.info('CANARY GUARD PASS: only %s may be published', matches[0]['file_name'])
             if self.cfg.inbox_chat is not None:
                 self.inbox = await self.client.get_entity(self.cfg.inbox_chat)
                 if self.inbox.id in (self.source.id, self.target.id):

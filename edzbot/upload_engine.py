@@ -38,6 +38,23 @@ from .publish_guard import (flood_seconds_from_message, set_cooldown,
 log = logging.getLogger(__name__)
 
 
+def source_media_reusable(original) -> bool:
+    """Fail closed: reuse source media ONLY when protection is explicitly safe.
+
+    A missing/unknown `noforwards` signal is treated as PROTECTED, so a
+    protected chat (chat.noforwards=True) or an indeterminate object can never
+    lead to a Telegram forwarding error or an ambiguous post.
+    """
+    if original is None or not getattr(original, 'media', None):
+        return False
+    if getattr(original, 'noforwards', None) is not False:
+        return False
+    chat = getattr(original, 'chat', None)
+    if chat is None or getattr(chat, 'noforwards', None) is not False:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Caption (OUMIJIA EDZ template, identical to Service.caption in bot.py)
 # ---------------------------------------------------------------------------
@@ -58,16 +75,17 @@ def build_caption(name: str, sha: str, brand: str | None = None,
 # ---------------------------------------------------------------------------
 class AdaptiveGovernor:
     def __init__(self, *, initial: int = 1, maximum: int = 2,
-                 success_streak: int = 25):
+                 success_streak: int = 25, allow_recovery: bool = True):
         self.minimum = 1
         self.maximum = max(1, min(2, maximum))          # hard cap per spec
         self.current = max(self.minimum, min(self.maximum, initial))
         self.success_streak = max(1, success_streak)
+        self.allow_recovery = allow_recovery            # False in canary mode
         self._good = 0
 
     def on_success(self) -> None:
         self._good += 1
-        if self._good >= self.success_streak and self.current < self.maximum:
+        if self.allow_recovery and self._good >= self.success_streak and self.current < self.maximum:
             self.current += 1
             self._good = 0
 
@@ -128,6 +146,7 @@ class EngineConfig:
     max_upload_bytes: int = 2 * 1024**3
     success_streak: int = 25
     canary_name: str = ''          # if set, ONLY this normalized name may be published
+    canary_mode: bool = False      # disables concurrency recovery; strictest gate
 
 
 class UploadEngine:
@@ -143,7 +162,8 @@ class UploadEngine:
         self.get_delay = get_delay or (lambda: 0.0)
         self.governor = AdaptiveGovernor(initial=self.cfg.concurrency,
                                          maximum=self.cfg.max_concurrency,
-                                         success_streak=self.cfg.success_streak)
+                                         success_streak=self.cfg.success_streak,
+                                         allow_recovery=not self.cfg.canary_mode)
         self.canary_name = normalize_edz_name(self.cfg.canary_name) if self.cfg.canary_name else None
         self.stats = UploadStats(sysinfo=sysinfo)
 
@@ -357,9 +377,7 @@ class UploadEngine:
                 and job.get('origin') == 'direct'):
             try:
                 original = await self.client.get_messages(self.source, ids=src)
-                protected = (getattr(original, 'noforwards', False) or
-                             getattr(getattr(original, 'chat', None), 'noforwards', False))
-                if original and getattr(original, 'media', None) and not protected:
+                if source_media_reusable(original):
                     media = original.media
             except Exception:
                 log.debug('Source media lookup failed; uploading local bytes', exc_info=True)
